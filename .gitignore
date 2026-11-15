@@ -7,6 +7,13 @@
 *.apla
 *.bin
 *.json
+!web/package.json
+!web/package-lock.json
+!web/tsconfig*.json
+!web/index.html
+/web/node_modules/
+/web/dist/
+/output/web-runs/
 
 # never commit model weights
 *.gguf
@@ -21,3 +28,4 @@
 .DS_Store
 __pycache__/
 *.pyc
+/web/*.tsbuildinfo

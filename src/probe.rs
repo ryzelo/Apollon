@@ -35,6 +35,7 @@ fn pos_label(q: usize) -> String {
 }
 
 pub struct Opts {
+    pub result_json: Option<PathBuf>,
     pub part: String,
     pub pos: Option<usize>,
     pub html: PathBuf,
@@ -802,6 +803,88 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, contrast: 
         n_passes: runner.n_passes.get(),
         secs,
     };
+    if let Some(path) = &o.result_json {
+        use serde_json::json;
+        let mut result = crate::export::result(m, ids, focus, ys[0], "probe", &top);
+        // one variant's output: log-odds change against the unchanged copy of the same pass
+        let outcome = |e: &Outcome| json!({"change":e.dlo(0),"change_rival":e.dlo(1),"kl":e.out.kl,
+            "top":crate::export::probabilities(m,&e.out.top)});
+        let t = ids.len();
+        let children: Vec<_> = rank.iter().map(|&i| {
+            let (pos, u) = units[i];
+            let mut item = json!({"id":format!("unit-{i}"),"label":unit(u),"layer":l,
+                "kind":if kind == Kind::Attn {"head"} else if kind == Kind::Mlp {"neuron"} else {"ple_dimension"},
+                "unit":u,"position":if pos==ALL {None} else {Some(pos)},"direct":null,
+                "total":-brute[i].dlo(0),"children":[],"kl":brute[i].out.kl,
+                "activation":r.value_at(pos,u),
+                "output_without":crate::export::probabilities(m,&brute[i].out.top),
+                "voice":unit_voice[i].map(|v| crate::export::probabilities(m,&v.top)),
+                "direct_voice":unit_voice[i].map(|v| v.dlo[0])});
+            if let Some(j) = deep_units.iter().position(|&x| x == i) {
+                item["dose"] = json!(DOSE.iter().enumerate().map(|(fi, f)| {
+                    let mut v = outcome(&dose[j * DOSE.len() + fi]);
+                    v["factor"] = json!(f);
+                    v
+                }).collect::<Vec<_>>());
+            }
+            item
+        }).collect();
+        let n_id = r.n_id();
+        let base = all_deep[n_id];
+        let comp_names = ["attention", "mlp", "ple"];
+        let downstream: Vec<_> = all_deep.iter().enumerate().take(n_id).map(|(vi, e)| {
+            let shifted = head_shifts(e, base, n_later, t);
+            let layers: Vec<_> = (0..n_later).map(|s| {
+                let (ti, t0) = (&e.deep.as_ref().unwrap()[s], &base.deep.as_ref().unwrap()[s]);
+                let (lv, lb) = (&lens[vi * n_later + s], &lens[n_id * n_later + s]);
+                let components: Vec<_> = (0..3).filter(|&c| c < 2 || m.blocks[l + s].ple.is_some()).map(|c| {
+                    let (a0, a1) = (r.comp(n_id, s, c), r.comp(vi, s, c));
+                    json!({"kind":comp_names[c],"direct_base":a0.dlo[0],"direct_variant":a1.dlo[0],
+                        "voice_base":crate::export::probabilities(m,&a0.top[..3]),
+                        "voice_variant":crate::export::probabilities(m,&a1.top[..3])})
+                }).collect();
+                let neurons: Vec<_> = neuron_shifts(ti, t0, &weights[s]).iter().take(8).map(|&(n, c)| json!({
+                    "unit":n,"activation_base":t0.act[n],"activation_variant":ti.act[n],"margin_change":c})).collect();
+                let heads: Vec<_> = shifted.iter().filter(|x| x.0 == s && x.2 > 0.02).take(4).map(|&(_, hh, tv)| json!({
+                    "head":hh,"shift":tv,"attention_base":t0.probs[hh * t..(hh + 1) * t],
+                    "attention_variant":ti.probs[hh * t..(hh + 1) * t]})).collect();
+                json!({"layer":l + s,
+                    "lens_base":{"target_log_odds":lb.lo[0],"top":crate::export::probabilities(m,&lb.top)},
+                    "lens_variant":{"target_log_odds":lv.lo[0],"top":crate::export::probabilities(m,&lv.top)},
+                    "components":components,"neurons":neurons,"heads":heads})
+            }).collect();
+            let of = deep_units.get(vi).map(|&i| units[i]);
+            json!({"label":r.deep_title(vi),"unit":of.map(|x| x.1),
+                "position":of.and_then(|x| if x.0 == ALL { None } else { Some(x.0) }),
+                "outcome":outcome(e),"layers":layers})
+        }).collect();
+        let positions: Vec<_> = (0..=focus).map(|q| json!({"position":q,"token":m.tok.piece(ids[q]),
+            "off_here":outcome(&by_pos[q]),"only_here":outcome(&only_here[q])})).collect();
+        let groups: Vec<_> = ks.iter().enumerate().map(|(j, &k)| json!({"k":k,"off":outcome(&grp_off[j]),"only":outcome(&grp_only[j])})).collect();
+        result["components"] = json!([{"id":"component","label":o.part,"layer":l,
+            "kind":if kind == Kind::Attn {"attention"} else if kind == Kind::Mlp {"mlp"} else {"ple"},
+            "direct":null,"total":-all_off.dlo(0),"children":children,
+            "all_off":outcome(&all_off),"positions":positions,"probed_position":if distributed {None} else {Some(q0)},
+            "groups":groups,"post_norm":r.post_norm(),
+            "flip":flip.map(|(k,(id,pr))| json!({"k":k,"id":id,"text":m.tok.piece(id),"probability":pr})),
+            "units_per_position":nu,"downstream":downstream,
+            "contrast_patches":contrast_res.as_ref().map(|(eg, names)| eg.iter().zip(names).map(|(e, n)| {
+                let mut v = outcome(e);
+                v["label"] = json!(n);
+                v
+            }).collect::<Vec<_>>())}]);
+        result["rival"] = json!({"id":ys[1],"text":m.tok.piece(ys[1]),"from_contrast_prompt":contrast.is_some()});
+        result["contrast_difference"] = json!(if contrast.is_some() { Some(contrast_diff.as_str()) } else { None });
+        result["dose_convention"] = json!("change = target log-odds of the variant minus the unchanged copy");
+        result["checks"] = json!([
+            {"label":"Unchanged variant", "deviation":dev_identity},
+            {"label":"Batched versus single variant", "deviation":dev_single}
+        ]);
+        result["preselected_from"] = json!(preselected);
+        result["intervention_scope"] = json!(if distributed {"all_positions"} else {"selected_position"});
+        result["report"] = json!(o.html.file_name().map(|x| x.to_string_lossy().to_string()));
+        crate::export::write(path, &result)?;
+    }
     terminal(&r, st);
     std::fs::write(&o.html, html(&r)).map_err(|e| format!("{}: {e}", o.html.display()))?;
     println!("  {} {}", st.bold("All units, dose curves and paths:"), o.html.display());

@@ -84,10 +84,44 @@ pub fn compute(m: &Model, l: usize, i: usize) -> Result<Static, String> {
     Ok(Static { rd, rep, inputs, outputs, check_in, check_out })
 }
 
-pub fn run(m: &Model, l: usize, i: usize, o: &Opts, html: &Path, st: &Style) -> Result<(), String> {
+/// The static view as structured data: every list holds the strongest arrows by |p| and by |q|.
+fn result_json(m: &Model, s: &Static, o: &Opts) -> serde_json::Value {
+    use serde_json::json;
+    let k = o.k.max(64);
+    let arrows = |v: &[Arrow]| -> serde_json::Value {
+        let item = |a: &Arrow| { let mut x = crate::trace::src_json(&a.src); x["label"] = json!(a.src.label(m)); x["p"] = json!(a.p); x["q"] = json!(a.q); x };
+        let (tp, tq) = top2(v, k);
+        json!({"count":v.len(),"by_p":tp.iter().map(item).collect::<Vec<_>>(),"by_q":tq.iter().map(item).collect::<Vec<_>>()})
+    };
+    let (rd, rep) = (&s.rd, &s.rep);
+    let mut voice = s.outputs.voice.clone();
+    voice.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let token = |&(t, x): &(u32, f32)| json!({"id":t,"text":m.tok.piece(t),"logit":x});
+    let n = voice.len();
+    let mut heads = s.outputs.heads.clone();
+    heads.sort_by(|a, b| b.2.max(b.3).max(b.4).total_cmp(&a.2.max(a.3).max(a.4)));
+    json!({"schema_version":2,"mode":"neuron","model":{"name":m.name,"layers":m.n_layer(),"architecture":m.arch},
+        "tokens":[],"output":[],"components":[],"generated":[],"answer":"",
+        "neuron":{"label":format!("S{} #{}", rd.l, rd.i),"layer":rd.l,"unit":rd.i,"gated":rd.gated,"activation_function":act_name(rd.act),
+            "repertoire":{"center":rep.c,"gram":rep.gram,"radius":rep.radius,"rank":rep.rank,
+                "activation_min":rep.a_min,"activation_max":rep.a_max,"point_min":rep.pt_min,"point_max":rep.pt_max},
+            "inputs":s.inputs.kinds.iter().map(|(kind, v)| { let mut x = arrows(v); x["group"] = json!(kind); x }).collect::<Vec<_>>(),
+            "runtime_only_head_layers":s.inputs.head_layers,
+            "outputs":{"neurons":arrows(&s.outputs.neurons),
+                "raises":voice.iter().take(k.min(n)).map(token).collect::<Vec<_>>(),
+                "lowers":voice[n.saturating_sub(k)..].iter().rev().map(token).collect::<Vec<_>>(),
+                "heads":heads.iter().take(k).map(|&(l2, h, q, kk, v)| json!({"layer":l2,"head":h,"query":q,"key":kk,"value":v})).collect::<Vec<_>>()}},
+        "checks":[{"label":"Inputs via the adjoint path against the forward path","deviation":s.check_in},
+            {"label":"Outputs read by rows against the same table read by columns","deviation":s.check_out}]})
+}
+
+pub fn run(m: &Model, l: usize, i: usize, o: &Opts, html: &Path, json: Option<&Path>, st: &Style) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     eprintln!("neuron S{l} #{i}: static arrows over all sources and targets …");
     let s = compute(m, l, i)?;
+    if let Some(path) = json {
+        crate::export::write(path, &result_json(m, &s, o))?;
+    }
     terminal(m, &s, o, st);
     std::fs::write(html, html_report(m, &s, o)).map_err(|e| format!("{}: {e}", html.display()))?;
     println!("  {} {}", st.bold("Report with the (p, q) plane:"), html.display());
