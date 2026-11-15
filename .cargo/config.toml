@@ -1,0 +1,4 @@
+# Build for the CPU of the machine that compiles (enables its SIMD instructions).
+# Remove this line to build a portable binary for other machines.
+[build]
+rustflags = ["-C", "target-cpu=native"]

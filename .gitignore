@@ -1,0 +1,23 @@
+# build output
+/target/
+
+# reports, dumps and atlases written by apollon
+/output/
+*.html
+*.apla
+*.bin
+*.json
+
+# never commit model weights
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+# local clutter
+.DS_Store
+__pycache__/
+*.pyc

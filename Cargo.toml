@@ -1,0 +1,25 @@
+[package]
+name = "apollon"
+version = "0.1.0"
+edition = "2021"
+description = "What does every part of a transformer contribute to one prediction? Exact, training-free decomposition of a single forward pass – down to single neurons and scalar products."
+license = "MIT"
+repository = "https://github.com/ryzelo/Apollon"
+readme = "README.md"
+keywords = ["transformer", "interpretability", "llm", "gguf", "safetensors"]
+categories = ["command-line-utilities", "science"]
+publish = false
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+serde_json = "1"
+fancy-regex = "0.14"
+libm = "0.2"
+unicode-normalization = "0.1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"

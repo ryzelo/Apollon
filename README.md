@@ -1,0 +1,317 @@
+# apollon
+
+**What does every part of a transformer contribute to one prediction?** apollon answers this for a single
+prompt, exactly and without training anything: no features, no labels, no surrogate model, only the matrix
+products of one forward pass. It is written in Rust without an ML framework and computes the forward pass
+itself, so it can record, split up and rerun everything inside it.
+
+* **`--decompose`** splits the pass into **token voices**. The residual stream at the end is exactly the sum of
+  its changes (embedding, every attention, every MLP). Each change is read out on its own as a distribution
+  over the vocabulary. Every change is then removed and the model rerun, which gives its **total effect**.
+* **`--probe "S12 MLP"`** is a **test bench for one component**. Every unit inside it (neuron, per-layer-embedding
+  dimension, head) is changed by brute force. apollon then follows what changes downstream, all the way to the
+  output.
+* **`--trace "S12 #2328"`**, **`--neuron`** and **`--atlas`** treat **one MLP neuron as a complete computing
+  structure**. `--trace` follows one prediction down to single scalar products and back through the positions
+  the heads read; `--neuron` reports without a prompt everything the neuron can do; `--atlas` stores that for all
+  neurons.
+
+Every analysis checks itself in every run: the parts have to add up to the real pass, and any violation is
+reported. The forward pass is compared against Hugging Face transformers in the test suite.
+
+## Install
+
+You need a recent stable Rust toolchain (tested with 1.96; the `rayon` dependency needs at least 1.80).
+
+```
+git clone https://github.com/ryzelo/Apollon.git
+cd Apollon
+cargo build --release
+./target/release/apollon --help
+```
+
+* **macOS (Apple Silicon)** is the tested platform. Large matrix products run through Apple's Accelerate.
+* **Other platforms** use plain-Rust fallbacks for the same operations. They are compiled and checked (forced
+  on macOS), but have not been run on Linux or Windows hardware.
+* `.cargo/config.toml` builds for the local CPU (`target-cpu=native`). Remove that line for a portable binary.
+
+apollon brings no weights. It reads models you already have on disk:
+
+* Ollama models (`~/.ollama/models` or `$OLLAMA_MODELS`)
+* the Hugging Face cache (`~/.cache/huggingface/hub` or `$HF_HUB_CACHE`)
+* any `.gguf` file
+* any folder with `config.json` + `*.safetensors` + `tokenizer.json`
+
+`apollon --list` shows which local models are supported.
+
+## Quick start
+
+```
+apollon -m EleutherAI/pythia-70m "The capital of France is"            # only the greedy answer
+apollon -m EleutherAI/pythia-70m --decompose "The capital of France is"
+apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --decompose "Was ist 2+2?"
+apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --probe "S16 MLP" --contrast "Was ist 2+3?" "Was ist 2+2?"
+apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --trace "S16 #2328" "Was ist 2+2?"
+apollon -m mlx-community/gemma-3-1b-it-4bit --neuron "S16 #2328"
+```
+
+`-m` takes an Ollama name (`qwen2.5:3b`), a Hugging Face cache name (`EleutherAI/pythia-70m`), a `.gguf` file or
+a model folder. `--chat` wraps the prompt in the model's chat format (Gemma 3/4, ChatML). The model's answer is
+generated greedily first. `--answer 7` analyzes the prediction of the 7th answer token (`--answer 1,6` analyzes
+several, and `--pos N` analyzes a prompt position instead). `--target " Paris"` picks the target token; by default
+it is the predicted one. With no analysis flag, apollon only prints the answer. Every analysis prints a report in
+the terminal and writes an expandable HTML report (`--html NAME` sets the base name).
+
+Documentation:
+
+* [FINDINGS.md](FINDINGS.md): what apollon showed on "Was ist 2+2?" ("What is 2+2?") in Gemma 3 1B and
+  Gemma 4 E4B.
+* [FUNCTIONS.md](FUNCTIONS.md): what every function in the code does, step by step, with its known limits.
+
+## Decomposition into token voices (`--decompose`)
+
+```
+apollon -m mlx-community/gemma-4-e4b-it-4bit --chat --answer 6 --decompose "Was ist 2+2?"
+```
+At the end, the stream at the focus token is exactly the sum of its changes. These are the embedding, every
+attention, every MLP and, in Gemma 4, every per-layer embedding (PLE). Each one is multiplied by the scalars of
+the later layers.
+
+1. **Direct voice.** Each change goes through the final norm on its own and then through the output matrix. The
+   norm centers for LayerNorm and does not for RMSNorm, and it divides by the *stored* scale of this pass, the
+   same for all changes. The softmax of the result is the change's voice. apollon shows its top tokens, its
+   entropy (how sharp it is), and which candidates of the real output it raises or lowers by how many percentage
+   points. The bias of the final norm gets its own row. With a logit softcap (Gemma), every token logit is scaled
+   by the fixed factor softcap(z)/z from this pass.
+2. **Checks.** The voice logits add up to the real logits, and the normalized product of all voices is the real
+   distribution (Pythia-70m: KL 3·10⁻⁸, Gemma 3 1B and Gemma 4 E4B: KL 0).
+3. **Parts.** Attention splits into heads (with their attention pattern), and heads split into source positions
+   (a_j·W_O v_j). MLPs split into neurons (a_i·W_down[:, i]). apollon shows the strongest (`--top K`, default 8)
+   and puts the rest in one row. They are preselected over the 64 most likely tokens.
+4. **Total effect.** apollon sets the change to zero at all positions (`--focus-only`: only at the focus token)
+   and reruns the model from its layer. The intermediate states come from the first pass; rerunning with nothing
+   removed is bit-identical. It reports the winners and losers of the distribution, the KL, and
+   **indirect = total − direct** on the log scale. Indirect contains two things: what runs through later blocks,
+   and the final norm rescaling once the change is gone. The second part is shown on its own as **"via norm"**:
+   the stream at the end minus the change, with only the final norm and the softcap recomputed. No later block
+   reads the last change, so there total = direct + via norm must hold (Pythia-70m: 1·10⁻⁵, Gemma 3 1B: 4·10⁻⁶ in
+   log-odds). **"Direct share"** compares the spread of the direct and the indirect log change. It is weighted over
+   the tokens that carry weight with or without the change.
+
+All factors refer to the **odds p/(1−p)** of the target token, not to p. For small p the two are the same. At
+p ≈ 1 (saturated), the odds still show how much lead a change adds. The terminal shows the overview of all changes
+in order and expands the four strongest. The HTML report (`<name>_decompose.html`; set the name with `--html NAME`)
+lets you expand everything.
+
+| Model | voices | reruns | time (Apple M3, 8 GB RAM) |
+|---|---|---|---|
+| Pythia-70m | 368 | 13 | 0.7 s |
+| Gemma 3 1B | 1,327 | 53 | 19 s |
+| Gemma 4 E4B | 3,865 | 127 | ≈ 6 min |
+
+## Probe: what do the units of a component do? (`--probe`)
+
+```
+apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --probe "S16 MLP" --contrast "Was ist 2+3?" "Was ist 2+2?"
+```
+You pick a component (`"S12 MLP"`, `"S11 PLE"`, `"S12 Attn"`; several with `;`). apollon changes every unit inside
+it by brute force (neuron, per-layer-embedding dimension, head) and reruns the model from that layer. Many variants
+run in **one** pass. Each variant is a copy of the positions from the changed spot up to the focus. Through
+attention, it sees the unchanged prefix and itself, never other variants. RoPE and windows use the real position,
+and from 64 rows on, the matrix multiplications run through Accelerate. Two checks run every time: the unchanged
+copy in the variant pass must equal the real pass, and one variant must equal the same edit run on its own.
+
+1. **Where does the component act?** It is zeroed completely at one position at a time, and also everywhere
+   except one position. If one position carries at least half of the effect, the probe runs there (**local**, or
+   choose with `--probe-pos N`). Otherwise the component is **distributed**, and every unit is changed at all
+   positions at once. For MLPs this uses the `--probe-max N` largest by Σ|a|·‖W_down[:, i]‖ (default 1024).
+2. **Brute force.** Every active unit is zeroed on its own. apollon reports the odds of the target and of the rival,
+   the KL, the new top token, and the unit's own voice (partial softmax of what it writes at the focus token).
+3. **Interplay.** The k strongest supports are switched off together, and conversely only they stay on
+   (k = 1, 2, 4, …, all). From which k does the answer flip, and do a few units carry the whole function?
+4. **Dose.** The activation is multiplied by −2, −1, 0, 0.5, 2 and 4 for the strongest units (`--depth N`,
+   default 6).
+5. **Path.** For the same units: the logit lens after every later layer, and the voice of every later attention /
+   MLP / PLE (unchanged → edited). It also shows which later neurons change and which heads look elsewhere
+   afterwards.
+6. **Contrast prompt** (`--contrast "Was ist 2+3?"`). Values from there are inserted: does the component carry the
+   number? The answer of the main prompt is reused with the same substitution applied to it, also when the model
+   inserts spaces ("2 + 2 =" → "2 + 3 ="). Both sequences must have the same number of tokens.
+
+The result appears in the terminal and as HTML (`<name>_probe_S16_MLP.html`). Gemma 3 1B, S16 MLP: 13,824 variants
+in 33 s. Gemma 4 E4B, S11 PLE: about 3 min; S12 MLP: about 8.5 min (with 8 GB RAM the machine swaps).
+
+Caveat: Gemma's MLP and PLE outputs pass through a post-norm. Switching off part of the units therefore scales the
+remaining ones up, and the probe warns about this.
+
+## One neuron down to single scalar products (`--trace`, `--neuron`, `--atlas`)
+
+```
+apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --trace "S16 #2328" "Was ist 2+2?"
+apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --trace auto "Was ist 2+2?"
+apollon -m mlx-community/gemma-3-1b-it-4bit --neuron "S16 #2328"
+apollon -m mlx-community/gemma-3-1b-it-4bit --atlas gemma3.apla [--atlas-k 64] [--atlas-layers 0..8]
+```
+Neuron i of layer l sees its whole input only through two numbers. The pre-norm turns the stream x into
+z = x/rms(x) (LayerNorm: (x − mean)/σ), so ‖z‖ ≤ √d. Then:
+
+* p = g'·z + c_g and q = u'·z + c_u, with the effective read vectors g' = w_gate ⊙ γ and u' = w_up ⊙ γ
+  (mean-free for LayerNorm) and the offsets c = w·β + b.
+* a = act(p)·q (gated: SwiGLU, GeGLU) or a = act(p) (not gated: GPT-NeoX, GPT-Neo).
+
+No features, no labels and no trained substitute model are involved, only the matrix products of this one
+pass. The neuron's "large matrix" g'u'ᵀ has rank 1 and is never formed.
+
+**Repertoire (`--neuron`, no prompt).** All reachable (p, q) form a filled ellipse c + √d·L·disk, with
+L Lᵀ = G the Gram matrix of g' and u'. For fixed p, act(p)·q is linear in q, so maximum and minimum lie on the
+boundary. apollon searches the boundary with an 8,192-step angle grid, refines with a golden-section search,
+and reports a_max, a_min, their angles and the input direction z* that reaches the maximum. If g' ∥ u', the
+ellipse collapses to a segment. A not-gated neuron reaches an interval.
+
+**Static arrows.** Every source reaches the MLP input along a fixed path of layer scalars and norms. The
+sources are:
+
+* token and position embeddings
+* every earlier neuron (its W_down column, through its post-norm)
+* every per-layer-embedding dimension
+* every bias
+
+With all norm scales held at 1 the path is linear. Each source therefore has an arrow (g'·v, u'·v) per unit of
+source activation. Heads have no static arrow, because what a head writes depends on what it reads; the report
+says so.
+
+The outputs of a neuron are the same table read the other way: its arrow in the (p, q) plane of every later
+neuron, its token voice through the final norm and the output matrix, and the length of its projection onto
+W_Q, W_K, W_V of every later head. The head values are marked as an approximation, because RoPE and the Q/K/V
+norms are ignored.
+
+**Runtime decomposition (`--trace`, at the focus of the usual `--answer`/`--pos` flow):**
+
+* *Level 0*: p − b = Σ_j W[i,j]·x̂_j, with the weights exactly as the forward pass unpacks them.
+* *Level 1*: with the frozen pre-norm scale s, every source c contributes p_c = s·g'·x_c, and Σ_c p_c = p.
+  The sources are the embedding, every head split into the positions it reads, every earlier neuron (all of
+  them), every PLE dimension and the biases. The reference point is the stream at the MLP input. Its own
+  layer's attention belongs to it, except in parallel-residual models.
+* *Level 0×1*: for one source, its own scalar products W[i,j]·γ_j·s·x_c,j. They are shown for the strongest
+  sources, or for any source requested with `--scalars-of "S14 head 1 @16"` (also `"S14 #868"`, `"token"`, …).
+* *Pairs*: with the frozen φ = act(p)/p, a = φ·Σ_c Σ_c' p_c·q_c' holds exactly. The pair table is an outer
+  product, so only the two lists are kept. Each source's share of a is a_c = φ/2·(p_c·q + p·q_c), and Σ a_c = a.
+* *Position in the repertoire*: a/a_max (or a/a_min) and the radius r ∈ [0, 1].
+* *Removal by rerun*:
+  * the neuron set to 0, giving direct, total and indirect effect as in `--decompose`;
+  * each strong source removed **only from this neuron**: p′ and q′ are recomputed exactly from Norm(x − x_c),
+    not with the frozen scale, and the resulting a′ is set via `patch`. The frozen-linear and the exact Δa are
+    reported side by side.
+* *Backward zoom*: from the neuron to its strongest sources, recursively into earlier neurons (`--trace-depth`,
+  `--trace-top`). Heads are split down to the position j they read, and from there into **what position j
+  carries**.
+  * With the attention weight, the norm scales at both positions and the value norm frozen, an atom is linear
+    in the stream x_j before the layer whose values the head reads (with shared K/V, the source layer).
+  * The reader's vectors go back through post-norm, W_O, the attention weight, value norm, W_V and the
+    pre-norm at j. The norm bias and value bias become a constant offset.
+  * The same source enumeration as at level 1 then splits x_j into the embedding at j, the heads and neurons at
+    j, PLE and biases, recursively across positions. Neurons at j are themselves decomposed at j.
+  * The parts at position j come from a recording pass with focus j. Its stream is checked to be bit-identical
+    to the main pass.
+
+Nothing is stored in advance. Every product is recomputed from the recorded pass.
+
+**Atlas.** The arrows of all neurons form one table C[later, earlier]. Read by rows it gives the inputs, read by
+columns the outputs. `--atlas` computes it tile by tile as GEMM (tokens, W_down of every earlier layer, PLE,
+biases) and keeps only the top k per row and per column. The full table would be far too large: for Llama 3.2
+1B over 100 GB, with several hundred trillion operations. The file (`APLA`, versioned header) has one fixed
+record per neuron: ellipse, a_max/a_min, the top-k inputs by |p| and by |q|, the outputs the same way, and the
+voice. It can be read through mmap, built in parts (`--atlas-layers`) and resumed. A resumed or repeated layer
+gives a byte-identical file. A layer's outputs are complete once all later layers are built. With `--atlas`,
+`--trace` shows where the runtime-strong sources rank among the static inputs.
+
+**Self-checks in every run:**
+
+* Σ scalar products = p − b;
+* Σ source vectors = the recorded stream; Σ sources = p and q; Σ pairs = a; a = the activation recorded by the
+  forward pass;
+* static arrow × runtime scales × activation = runtime contribution (adjoint against vector path);
+* r ≤ 1 and a_min ≤ a ≤ a_max – a violation is reported loudly;
+* rerun with the original value = clean pass;
+* in the zoom: Σ sources at the read position + offset = atom, Σ source vectors = the checkpoint stream, and the
+  pass at the read position = the main pass.
+
+The atlas checks one neuron per layer against the on-demand computation, and at the end the column side.
+BERT/RoBERTa get the static part only, through the chain of LayerNorms; `--trace` refuses them with a message.
+
+Gemma 3 1B (Apple M3, 8 GB RAM):
+
+* `--neuron`: 0.7 s
+* `--trace` of one neuron with reruns and zoom: 1.4 s; zoom depth 3 with 30 read positions decomposed: 12 s
+* `--atlas`: about 11 s per layer; with k = 64 the file is 1.1 GB (Gemma 4 E4B: about 2.7 GB)
+
+## Supported – the construction kit
+
+A weight file contains no computation recipe. apollon therefore assembles every layer from components that it
+derives from the configuration and the weights:
+
+* norms before and/or after attention and MLP (RMS/LayerNorm), and pre-, parallel- or post-LN residuals
+* GQA/MQA, sliding windows, q/k/v norms and shared keys/values
+* RoPE (normal, pairwise, NeoX, Llama 3, linear, proportional/partial) and learned positions
+* score and logit softcapping
+* gated and ungated MLPs (SiLU, GELU, GELU-tanh), per-layer embeddings and layer scalars
+* bidirectional encoders without a head
+
+| Family | GGUF (Ollama) | safetensors / MLX 4-bit |
+|---|---|---|
+| llama, mistral, qwen2, qwen3 | ✓ | ✓ |
+| gemma4 | ✓ | ✓ |
+| gemma3 | – | ✓ |
+| gpt_neox (Pythia) | – | ✓ |
+| gpt_neo (TinyStories) | – | ✓ |
+| bert / roberta (encoder) | – | ✓ (forward pass and dump only, no prediction) |
+
+* GGUF weights: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K–Q6_K, IQ4_NL, IQ4_XS, MXFP4; MLX affine
+  2–8 bit. Everything stays in the memory-mapped file and is unpacked row by row while computing.
+* Tokenizers: byte-level BPE (GPT-2, Qwen, Llama 3, GPT-NeoX, RoBERTa via vocab.json + merges.txt), and
+  SentencePiece with scores (GGUF llama) or with merges (Gemma, Llama 2 `tokenizer.json`).
+* In the Hugging Face cache, files are merged across all snapshots of a model.
+* For Gemma, `<bos>` is prepended when the tokenizer does not do it itself (as llama.cpp/Ollama do).
+
+Not described yet (clear error message): mixture-of-experts, Gemma 2, Phi, GPT-2, Falcon …
+
+## Tested
+
+| Test | Result |
+|---|---|
+| `tests/compare_hf.py`: transformers on tiny Llama, Pythia-14m/70m, random Qwen2/Qwen3/Llama 3 RoPE | tokens equal; residual per layer + logits: max. rel. dev. 7·10⁻⁸ … 8·10⁻⁵ |
+| `tests/compare_hf_extra.py`: transformers on random Gemma 3/Gemma 4 with all special parts (prompt longer than the sliding window, shared K/V, PLE, scalars, softcapping), real TinyStories-33M (GPT-Neo), real unixcoder (RoBERTa) | max. rel. dev. 6·10⁻⁷ … 1.6·10⁻⁵ |
+| `tests/compare_gguf_llama.py`: Llama as GGUF (q/k permuted, SentencePiece with scores) | tokens equal, logits 2.5·10⁻⁷ |
+| `tests/compare_dequant_qwen_tok.py`: 16 weight formats against `gguf`; Qwen2.5 GGUF tokenizer against Qwen's `tokenizer.json` | bit-identical; 10/10 |
+| `tests/compare_mlx.py`: MLX 4-bit against Apple's `mx.dequantize` (gemma-3-1b, gemma-4-e4b) | bit-identical |
+| `tests/compare_tokenizer.py`: Gemma 4 (GGUF + MLX), Gemma 3, GPT-Neo, RoBERTa against the originals | 10/10 texts per model |
+| `tests/compare_ollama.py`: the sorted top-5 probabilities against Ollama's logprobs (needs a running Ollama server) | qwen2.5:3b: ≤ 0.1 percentage points on five prompts, 2.8 on the chat prompt (Ollama computes with its own implementation and rounded activations) |
+| `tests/compare_neuron.py`: `--trace … --dump-neuron` against transformers hooks + NumPy for random Llama, Qwen3, Gemma 3 and the real Pythia-14m: p, q, a, s, x̂, every scalar product, the contribution of the embedding, every head and every earlier neuron, biases, Gram matrix, extremes (400k-angle grid, 20k random inputs); for the strongest atom from layer 1 on, the chain to its read position, the value offset, and every source at that position | max. rel. dev. 10⁻⁹ … 1.4·10⁻⁶ |
+| `cargo test`: ellipse extremes against random inputs on the sphere (2–32 dimensions, all activations, degenerate cases) | no sample above a_max or below a_min, extremes reached |
+
+On Pythia-14m, float32 rounding matters: the model has very large activations. On the sentence "Numbers 12345 and
+umlauts: äöüß €", apollon deviates by 2.2·10⁻⁴ from a float64 reference, and transformers in float32 by 1.1·10⁻⁴.
+On the test sentences it stays below 10⁻⁴. The test inputs are deliberately multilingual (umlauts, emoji, CJK,
+special tokens).
+
+Running the tests:
+
+```
+cargo test --release                                   # unit tests (no models needed)
+pip install --target /tmp/ref transformers gguf tokenizers safetensors torch numpy
+PYTHONPATH=/tmp/ref python3 tests/compare_hf.py target/release/apollon /tmp/work
+PYTHONPATH=/tmp/ref python3 tests/compare_neuron.py target/release/apollon /tmp/work
+```
+
+* Every script states in its docstring which models it needs. The small random models are generated on the
+  fly; the real ones (Pythia, TinyStories, unixcoder, the Gemma tokenizers) must be in the Hugging Face cache.
+* Cases whose model is missing are skipped.
+* `compare_mlx.py` needs the `mlx` package (Apple Silicon).
+* `--dump FILE` and `--tokens-only` exist for these tests.
+
+**Memory:** apollon itself needs little RAM, because the weights stay in the file. If Ollama holds the same large
+model in memory at the same time, swap grows a lot on an 8 GB machine. Running `ollama stop <model>` first helps.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Model weights are not part of this repository; their own licenses apply.
