@@ -1,6 +1,6 @@
 # apollon – what the technique does and what we found
 
-As of 2026-11-14 · models: Gemma 3 1B and Gemma 4 E4B (MLX 4-bit), Pythia-70m for testing.
+As of 2026-11-16 · models: Gemma 3 1B and Gemma 4 E4B (MLX 4-bit), Pythia-70m for testing.
 The prompt is usually "Was ist 2+2?" ("What is 2+2?") in chat format; what we study is the answer token "4".
 
 ## The technique
@@ -74,6 +74,25 @@ Checks:
 - **S12 MLP** is general infrastructure. No single neuron changes the odds by even ×2; even the 512 strongest
   together do not flip the answer, and values from "2+3" give ×1.75. Removed completely, it produces nonsense
   ("ein"): the model stops working.
+
+### Gemma 3 1B down to single scalar products (`--circuit`)
+`--circuit` on "Was ist 2+2?" (chat), the answer token "4" at position 21 (the answer so far is "2 + 2 = ").
+Mean ablation position by position over five prompts of the same form with other numbers ("Was ist 3+5?",
+"6+1", "4+3", "7+2", "1+8"), norms frozen at the full model's scales, criterion KL ≤ 0.1 and the same top token.
+
+- Of 1.54·10¹⁰ atoms (scalar products), **18,948 stay on**, and every one of them is individually necessary. With
+  only them the model still says "4" (91%); with everything *except* them it says **"2"** (100%, KL 14.1).
+- **Where:** the two operands "2" in the answer, positions 16 and 19, run through S0 neurons #1648 and #2779
+  (and #4312), S3 #4838 and #6027 and S16 #4740. At the answer position 21, heads 1 and 3 of S14, heads 1–3 of
+  S17, head 0 of S18 and head 3 of S22 read them, together with neurons in S15, S16 (#6792), S17, S18, S22 and S23.
+- **The single most necessary products** are in the mixing (A·V) of S18 head 0 and of S17 heads 1 and 3 reading
+  position 16, the first operand: S18 head 0, key 16, dimension 93 alone drops "4" to 66%.
+- This agrees with the component-level findings above: S16 MLP and S17 attention carry the number (without
+  them the answer is "2"), and the probe already saw head 3 of S17 looking at the operand.
+- 365k exact tests in 2,279 passes, 45 minutes on the M3 GPU (Metal). Two earlier variants were artifacts and
+  are kept only as warnings: with *live* norms the post-norm inflated 20 atoms of one neuron (S24 #5561) to full
+  size, and everything except them still said "4"; with means over all positions but without `<bos>`, the
+  circuit mostly kept the attention sink at `<bos>` intact.
 
 ### Earlier (backtracking mode of the predecessor tool, since removed): 167 + 186
 Gemma 4 computes 353 correctly. Before the hundreds digit, "三百" (three hundred) shows up as an intermediate

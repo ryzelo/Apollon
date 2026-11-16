@@ -356,8 +356,14 @@ prediction breaks without each one alone, with the value of every single atom; t
 (1 = components … 4 = atoms), `--circuit-tests N` stops refining after N tests (what is unresolved then stays
 whole, and the report says so), `--dump-circuit FILE` writes the cut cell by cell and the logits as JSON.
 
-**Example** (Pythia-14m, "Monday, Tuesday, Wednesday," → " Wednesday", 24%): of 7,110,144 atoms, 1,989 stay
-on with frozen norms. With only them the model still says " Wednesday" (24%, KL 0.0998); with everything
+**Example** (Gemma 3 1B, "Was ist 2+2?" → "4", mean ablation over five prompts with other numbers): of
+1.54·10¹⁰ atoms, 18,948 stay on. With only them the model still says "4" (91%); without them it says "2".
+They follow the two operands "2" through early neurons into heads of layers 14, 17 and 18 at the answer
+position; the most necessary single product is in the mixing of layer 18, head 0, reading the first operand.
+45 minutes on the M3 GPU – see [FINDINGS.md](FINDINGS.md).
+
+**Example** (Pythia-14m, "Monday, Tuesday, Wednesday," → " Wednesday", 24%, zero ablation): of 7,110,144 atoms,
+1,989 stay on with frozen norms. With only them the model still says " Wednesday" (24%, KL 0.0998); with everything
 except them it says " and" (KL 8.8). About 1.02 million exact tests in 8,750 passes, 6.5 minutes on an Apple M3 –
 most of it in the final phase, which resolves 200,000 atoms in blocks down to single ones. With live norms
 the circuit has 803 atoms; its most necessary single product is a score in layer 3, head 3 – query "," [5] ·
@@ -375,10 +381,10 @@ key " Wednesday" [4], dimension 25.
   reference, not about arithmetic.
 * A key whose score products are all off gets the score 0, not −∞: taking a key out of the softmax is not a
   matrix product, so it is not an atom.
-* The runtime grows with the size of the circuit (roughly 2 tests per atom in the final phase) and with the
-  number of sequential steps: every accepted step is a standalone rerun. Gemma 3 1B with frozen norms keeps
-  150 of 1,716 components at level 1 (5 min) and needs more than an hour for the finer levels on an 8 GB M3.
-  `--circuit-depth` and `--circuit-tests` bound it.
+* The runtime grows with the size of the circuit (most of it goes into resolving the last blocks down to
+  single atoms) and with the number of sequential steps: every accepted step is a standalone rerun. Gemma 3
+  1B: 45 minutes to single atoms on an 8 GB M3 with the GPU, under 2 minutes to heads and neurons
+  (`--circuit-depth 2`). `--circuit-depth` and `--circuit-tests` bound it.
 
 ## GPU: Metal and CUDA
 
