@@ -1,7 +1,7 @@
 // Types of the local engine's API and the calls the workspace makes.
 import type { Part } from "./scene";
 
-export type Kind = "generate" | "decompose" | "probe" | "trace" | "neuron" | "atlas" | "tokens" | "dump";
+export type Kind = "generate" | "decompose" | "probe" | "trace" | "circuit" | "neuron" | "atlas" | "tokens" | "dump";
 export type Token = { id: number; text: string; index: number };
 export type Prob = { id: number; text: string; probability: number };
 /** A token whose probability a change moves: without the change, and with it. */
@@ -71,6 +71,22 @@ export type NeuronStatic = {
   };
 };
 
+/** One output of the circuit search: its three most likely tokens, the target's log-odds and the KL to the full model.
+ *  Values can be null when the engine produced no finite number. */
+export type CircuitOut = { top: { id: number; text: string; probability: number | null }[]; target_log_odds: number | null; kl: number | null };
+export type CircuitCell = { layer: number; position: number; attention: number; kv: number; mlp: number; ple: number };
+export type CircuitInfo = {
+  criterion_kl: number; depth: number;
+  ablation: "mean" | "zero"; ablation_text: string; norms: "frozen" | "live"; norms_text: string;
+  reference_sequences: number; reference_positions: number;
+  atoms_kept: number; atoms_total: number; leaves: number; leaves_listed: number;
+  full: CircuitOut; circuit: CircuitOut; complement: CircuitOut;
+  levels: { level: number; name: string; groups: number; pieces_in: number; kept: number; unresolved: number; atoms: number; kl: number; tests: number; passes: number; seconds: number }[];
+  layers: { layer: number; on: Record<string, number>; total: Record<string, number>; units: string[] }[];
+  cells: CircuitCell[];
+  tests: number; passes: number; commits: number; refused: number; seconds: number; stopped: boolean;
+};
+
 export type Result = {
   schema_version: number;
   mode: string;
@@ -86,6 +102,8 @@ export type Result = {
   answer?: string;
   /** only in a static neuron result */
   neuron?: NeuronStatic;
+  /** only in a circuit result */
+  circuit?: CircuitInfo;
 };
 export type Request = {
   model: string; prompt: string; kind: Kind; answer: number; target?: string | null; component?: string | null;
@@ -149,6 +167,7 @@ export function runLabel(r: Request): string {
     case "decompose": return `Decompose token ${r.answer}`;
     case "probe": return `Probe ${r.component || ""}`;
     case "trace": return `Trace ${r.component === "auto" ? "strongest neurons" : r.component || ""}`;
+    case "circuit": return `Circuit token ${r.answer}`;
     case "neuron": return `Static ${r.component || "neuron"}`;
     case "atlas": return "Neuron atlas";
     case "tokens": return "Token IDs";

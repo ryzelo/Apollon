@@ -145,10 +145,10 @@ def linear_sites(ly, neox):
 def hf_means(hf, kind, J):
     """Mean ablation, computed here from transformers alone, with the rules apollon states: per position of
     the analyzed sequence the mean over the references at that position (position-wise, with
-    --circuit-ref; and position 0 if it is <bos>), else the mean over all positions of the references
-    except a leading special token. Means of the input of every projection and of the factors of QKᵀ and
+    --circuit-ref; and position 0 if it is <bos>), else the mean over the typical positions of the
+    references (apollon's ref_positions: no position 0, no attention sink). Means of the input of every projection and of the factors of QKᵀ and
     A·V (q, k, v as the attention gets them, the attention weights per query/key position; their fallback
-    is the mean weight on <bos> or on any other key)."""
+    is the mean weight on key 0 or on any other typical key)."""
     neox = kind == "neox"
     layers = hf.gpt_neox.layers if neox else hf.model.layers
     T = len(J["tokens"])
@@ -166,9 +166,9 @@ def hf_means(hf, kind, J):
 
     def slots(p):
         out = []
-        if p < T and (pw or (p == 0 and bos and cur["start"] == 1)):
+        if p < T and (pw or (p == 0 and bos and cur["lead"])):
             out.append(p)
-        if p >= cur["start"]:
+        if p in cur["used"]:
             out.append("g")
         return out
 
@@ -199,7 +199,9 @@ def hf_means(hf, kind, J):
                 if sl == "g":
                     w = att.setdefault((l, "g"), [np.zeros((H, 2)), np.zeros((H, 2))])
                     for j in vis:
-                        c = 0 if (j == 0 and cur["start"] == 1) else 1
+                        if j != 0 and j not in cur["used"]:
+                            continue
+                        c = 0 if j == 0 else 1
                         w[0][:, c] += a[:, p, j]
                         w[1][:, c] += 1
                 else:
@@ -225,7 +227,9 @@ def hf_means(hf, kind, J):
     try:
         with torch.no_grad():
             for toks, used in zip(J["ref_tokens"], J["ref_positions"]):
-                cur["start"] = used[0] if used else len(toks)
+                cur["used"] = set(used)
+                # a leading special token: the analyzed sequence starts with one, and so does this reference
+                cur["lead"] = len(toks) > 1 and toks[0] == J["tokens"][0]
                 hf(torch.tensor([toks]))
     finally:
         for h in hooks:
@@ -255,7 +259,7 @@ def hf_means(hf, kind, J):
                     if w is not None and w[1][h, j] > 0:
                         row[h, j] = w[0][h, j] / w[1][h, j]
                     else:
-                        c = 0 if (j == 0 and bos) else 1
+                        c = 0 if j == 0 else 1
                         row[h, j] = g[0][h, c] / max(g[1][h, c], 1)
             am[(l, p)] = row
     # how far apollon's own means are from these

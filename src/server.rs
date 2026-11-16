@@ -218,6 +218,7 @@ async fn create(
             "decompose",
             "probe",
             "trace",
+            "circuit",
             "neuron",
             "atlas",
             "tokens",
@@ -234,6 +235,18 @@ async fn create(
         && request.component.as_deref().unwrap_or("").trim().is_empty()
     {
         return Err(error(StatusCode::BAD_REQUEST, "Select a component"));
+    }
+    // choices the engine takes from a fixed list
+    for (key, allowed) in [
+        ("gpu", &["auto", "metal", "cuda", "off"][..]),
+        ("circuit-ablation", &["mean", "zero"][..]),
+        ("circuit-norms", &["frozen", "live"][..]),
+    ] {
+        if let Some(v) = request.options.get(key).filter(|v| !v.is_empty()) {
+            if !allowed.contains(&v.as_str()) {
+                return Err(error(StatusCode::BAD_REQUEST, format!("{key} must be one of {}", allowed.join(", "))));
+            }
+        }
     }
     let id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -325,6 +338,7 @@ async fn execute(
         "decompose" => &["top"],
         "probe" => &["probe-pos", "probe-max", "depth", "contrast"],
         "trace" => &["trace-depth", "trace-top", "scalars", "scalars-of"],
+        "circuit" => &["circuit-kl", "circuit-depth", "circuit-tests", "circuit-ablation", "circuit-norms", "circuit-ref"],
         "atlas" => &["atlas-k", "atlas-layers"],
         _ => &[],
     };
@@ -332,6 +346,7 @@ async fn execute(
         .iter()
         .copied()
         .chain(["threads"])
+        .chain((!matches!(r.kind.as_str(), "atlas" | "tokens")).then_some("gpu"))
         .chain((!static_run).then_some("pos"))
     {
         if let Some(value) = r.options.get(key).filter(|v| !v.trim().is_empty()) {
@@ -373,6 +388,10 @@ async fn execute(
         "trace" => {
             cmd.args(["--trace", r.component.as_deref().unwrap()]);
             cmd.arg("--dump-neuron").arg(dir.join("neuron-trace.json"));
+        }
+        "circuit" => {
+            cmd.arg("--circuit");
+            cmd.arg("--dump-circuit").arg(dir.join("circuit.json"));
         }
         "neuron" => {
             cmd.args(["--neuron", r.component.as_deref().unwrap()]);
@@ -454,7 +473,7 @@ async fn artifact_paths(app: &App, id: &str) -> Result<Vec<String>, ApiError> {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
         if (name.starts_with("report_") && name.ends_with(".html"))
-            || matches!(name.as_str(), "atlas.apla" | "forward.bin" | "tokens.json" | "neuron-trace.json")
+            || matches!(name.as_str(), "atlas.apla" | "forward.bin" | "tokens.json" | "neuron-trace.json" | "circuit.json")
         {
             files.push(name);
         }

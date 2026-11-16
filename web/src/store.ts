@@ -31,7 +31,7 @@ function writeHash(ui: Ui) {
 /** The run to open first: the newest one that measured something, else the newest that completed. */
 function firstRun(runs: Job[]): string {
   const done = runs.filter((r) => r.status === "completed");
-  return (done.find((r) => ["decompose", "probe", "trace"].includes(r.request.kind)) || done.find((r) => r.request.kind === "generate") || done[0] || runs.find(busy))?.id || "";
+  return (done.find((r) => ["decompose", "probe", "trace", "circuit"].includes(r.request.kind)) || done.find((r) => r.request.kind === "generate") || done[0] || runs.find(busy))?.id || "";
 }
 
 export function useWorkspace() {
@@ -92,7 +92,8 @@ export function useWorkspace() {
 
   // the open run's result, polled while it is in progress
   useEffect(() => {
-    if (!ui.run) return;
+    // wait for the run list: a detail fetched before it arrives would be dropped
+    if (!ui.run || !loaded) return;
     let active = true;
     let timer = 0;
     const load = async () => {
@@ -107,7 +108,7 @@ export function useWorkspace() {
     };
     void load();
     return () => { active = false; clearTimeout(timer); };
-  }, [ui.run]);
+  }, [ui.run, loaded]);
 
   // a freshly opened run starts in the view and metric that suit its analysis
   useEffect(() => {
@@ -115,7 +116,7 @@ export function useWorkspace() {
     if (job.status === "completed" && !job.result) return;
     settled.current = job.id;
     const k = job.request.kind;
-    setUi((old) => ({ ...old, metric: k === "probe" ? "total" : "direct" }));
+    setUi((old) => ({ ...old, metric: k === "probe" || k === "circuit" ? "total" : "direct" }));
   }, [job]);
 
   const open = useCallback((id: string) => setUi((old) => (old.run === id ? old : { ...old, run: id, sel: "" })), []);

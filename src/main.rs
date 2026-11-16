@@ -278,7 +278,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if a.result_json.is_some() {
-        let modes = usize::from(a.decompose) + usize::from(!a.probe.is_empty()) + usize::from(!a.trace.is_empty());
+        let modes = usize::from(a.decompose) + usize::from(a.circuit) + usize::from(!a.probe.is_empty()) + usize::from(!a.trace.is_empty());
         if modes > 1 || a.answer.len() > 1 || a.neuron.len() > 1 || (modes > 0 && !a.neuron.is_empty()) || a.dump.is_some() || a.tokens_only || (a.atlas.is_some() && a.trace.is_empty()) {
             return Err("--result-json accepts one runtime analysis and one answer position per invocation".into());
         }
@@ -677,6 +677,7 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
                 show: a.circuit_show.unwrap_or(25),
                 html: PathBuf::from(format!("{base}_circuit{suffix}.html")),
                 dump: a.dump_circuit.as_ref().map(PathBuf::from),
+                result_json: a.result_json.clone(),
                 random: a.circuit_random,
                 frozen: a.circuit_norms.as_deref() != Some("live"),
                 mean: a.circuit_ablation.as_deref() != Some("zero"),

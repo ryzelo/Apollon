@@ -1,6 +1,6 @@
 // The panel for one run: what was asked, the selected part with its interventions, and the run's checks and files.
 import React, { useEffect, useState } from "react";
-import { Detail, Job, NeuronStatic, Prob, Request, Result, api, artifactUrl, busy, descendants, fmt, int, neuronSpec, pct, probeSpec, runLabel, shortModel, tokenText } from "../api";
+import { CircuitInfo, CircuitOut, Detail, Job, NeuronStatic, Prob, Request, Result, api, artifactUrl, busy, descendants, fmt, int, neuronSpec, pct, probeSpec, runLabel, shortModel, tokenText } from "../api";
 import { Metric, Part, familyColor, familyOf, valueOf } from "../scene";
 
 export function Lane({ label, value, max, color, active, before, onClick, mono, text }: {
@@ -36,13 +36,13 @@ export function Probs({ items, n = 5, mark }: { items: Prob[]; n?: number; mark?
 }
 
 /** The real output next to the output of the intervention, so a changed answer is seen at once. */
-function BeforeAfter({ real, without, label, target }: { real: Prob[]; without: Prob[]; label: string; target: number }) {
+function BeforeAfter({ real, without, label, target, base = "Real pass" }: { real: Prob[]; without: Prob[]; label: string; target: number; base?: string }) {
   const flips = real[0] && without[0] && real[0].id !== without[0].id;
   return (
     <div className="ap-voice">
-      <span className="np-caption">Output · real pass and without {label}</span>
+      <span className="np-caption">Output · {base.toLowerCase()} and without {label}</span>
       <div className="ap-beforeafter">
-        <div><span className="ap-quiet">Real pass</span><Probs items={real} n={3} mark={target} /></div>
+        <div><span className="ap-quiet">{base}</span><Probs items={real} n={3} mark={target} /></div>
         <div><span className="ap-quiet">Without it</span><Probs items={without} n={3} mark={target} /></div>
       </div>
       <p className="np-note">
@@ -67,13 +67,16 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
     ? part.attention.map((w, j) => ({ j, w })).sort((a, b) => b.w - a.w).slice(0, 6).filter((x) => x.w > 0.005)
     : [];
   const kidMax = Math.max(...(part.children || []).map((x) => Math.abs(valueOf(x, metric) ?? 0)), 1e-6);
+  const circuit = result.mode === "circuit" ? result.circuit : undefined;
   return (
     <section className="np-section" style={{ ["--accent" as string]: familyColor(familyOf(part)) }}>
       <span className="np-caption">Selected part</span>
       <div className="ap-inspect">
         <div>
           <h2 className="ap-h2">{part.label}</h2>
-          <p className="np-note">{part.kind}{part.layer != null && part.layer >= 0 ? ` in layer ${part.layer}` : ""}. Log-odds of the target with it minus without it.</p>
+          <p className="np-note">{part.kind}{part.layer != null && part.layer >= 0 ? ` in layer ${part.layer}` : ""}{part.position != null ? ` at position ${part.position}` : ""}. {circuit
+            ? part.children?.length ? "Sum over its leaves of the target’s log-odds in the circuit minus without the leaf, each removed alone." : "Log-odds of the target in the circuit minus in the circuit without this leaf."
+            : "Log-odds of the target with it minus without it."}</p>
         </div>
         <span className="np-stat">{fmt(value)}</span>
       </div>
@@ -84,14 +87,14 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
       <table className="np-table">
         <tbody>
           {part.direct != null && <tr><td>Direct contribution</td><td>{fmt(part.direct)}</td></tr>}
-          {part.total != null && <tr><td>Total effect, removed and rerun</td><td>{fmt(part.total)}</td></tr>}
+          {part.total != null && <tr><td>{circuit ? "Effect in the circuit, removed and rerun" : "Total effect, removed and rerun"}</td><td>{fmt(part.total)}</td></tr>}
           {part.total != null && part.direct != null && <tr><td>Indirect, through later layers</td><td>{fmt(part.total - part.direct)}</td></tr>}
           {part.indirect_norm != null && <tr><td>Of that, only the final norm rescaling</td><td>{fmt(part.indirect_norm)}</td></tr>}
           {part.direct_voice != null && <tr><td>Direct contribution at the focus</td><td>{fmt(part.direct_voice)}</td></tr>}
           {part.activation_contribution != null && <tr><td>Share of the activation</td><td>{fmt(part.activation_contribution)}</td></tr>}
-          {part.activation != null && <tr><td>Activation</td><td>{fmt(part.activation)}</td></tr>}
-          {part.kl != null && <tr><td>KL divergence of the output without it</td><td>{part.kl.toExponential(2)}</td></tr>}
-          {part.count != null && <tr><td>Sources in this remainder</td><td>{int(part.count)}</td></tr>}
+          {part.activation != null && <tr><td>{circuit ? "Value of the product" : "Activation"}</td><td>{fmt(part.activation)}</td></tr>}
+          {part.kl != null && <tr><td>{circuit ? "KL to the full model without it" : "KL divergence of the output without it"}</td><td>{part.kl.toExponential(2)}</td></tr>}
+          {part.count != null && <tr><td>{circuit ? "Scalar products (atoms) in it" : "Sources in this remainder"}</td><td>{int(part.count)}</td></tr>}
         </tbody>
       </table>
 
@@ -113,7 +116,9 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
         </div>
       )}
 
-      {!!without?.length && <BeforeAfter real={result.output} without={without} label={part.label} target={result.target?.id} />}
+      {!!without?.length && (circuit
+        ? <BeforeAfter real={probsOf(circuit.circuit)} without={without} label={part.label} target={result.target?.id} base="Circuit" />
+        : <BeforeAfter real={result.output} without={without} label={part.label} target={result.target?.id} />)}
 
       {(!!part.raises?.length || !!part.lowers?.length) && (
         <div className="ap-voice">
@@ -181,6 +186,66 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
           {part.children.length > 12 && <p className="np-note">The first 12 of {int(part.children.length)} are listed. The table view holds all of them.</p>}
         </div>
       )}
+    </section>
+  );
+}
+
+/** Probabilities of a circuit output, without the entries the engine could not compute. */
+const probsOf = (o: CircuitOut): Prob[] => o.top.filter((t) => t.probability != null && Number.isFinite(t.probability)).map((t) => ({ ...t, probability: t.probability! }));
+const num = (v: number | null | undefined, digits = 3) => (v == null || !Number.isFinite(v) ? "not finite" : v.toFixed(digits));
+const big = (n: number) => (n >= 1e9 ? `${(n / 10 ** Math.floor(Math.log10(n))).toFixed(2)}·10^${Math.floor(Math.log10(n))}` : int(n));
+
+/** The result of a circuit search: how much of the model is left, and what it predicts with and without the rest. */
+function CircuitSummary({ c, target }: { c: CircuitInfo; target?: number }) {
+  const share = c.atoms_kept / Math.max(1, c.atoms_total);
+  const rows: [string, string, CircuitOut][] = [
+    ["Full model", "Every step switched on.", c.full],
+    ["Circuit only", "Only the kept steps; everything else is replaced.", c.circuit],
+    ["Everything but the circuit", "The kept steps replaced, the rest switched on.", c.complement],
+  ];
+  return (
+    <section className="np-section" style={{ ["--accent" as string]: "#ff5fc8" }}>
+      <span className="np-caption">Circuit</span>
+      <div className="ap-inspect">
+        <div>
+          <h2 className="ap-h2">{big(c.atoms_kept)} of {big(c.atoms_total)} scalar products kept</h2>
+          <p className="np-note">{share >= 0.001 ? `${(share * 100).toFixed(2)}%` : `${(share * 100).toExponential(1)}%`} of the forward pass, in {int(c.leaves)} leaves. Criterion: the same top token and KL to the full model at most {Number(c.criterion_kl.toPrecision(4))} nats.</p>
+        </div>
+        <span className="np-stat">{int(c.leaves)}</span>
+      </div>
+      {rows.map(([label, note, o]) => {
+        const items = probsOf(o);
+        return (
+          <div className="ap-voice" key={label}>
+            <span className="np-caption">{label}{items.length ? ` · KL ${num(o.kl, 4)} · target log-odds ${num(o.target_log_odds, 2)}` : ""}</span>
+            {items.length ? <Probs items={items} n={3} mark={target} /> : <p className="np-error">The engine produced no finite output here.</p>}
+            <p className="np-note">{note}</p>
+          </div>
+        );
+      })}
+      <table className="np-table">
+        <tbody>
+          <tr><td>Removed steps replaced by</td><td>{c.ablation === "mean" ? `mean over ${int(c.reference_positions)} positions in ${int(c.reference_sequences)} prompt${c.reference_sequences === 1 ? "" : "s"}` : "zero"}</td></tr>
+          <tr><td>Normalization</td><td>{c.norms === "frozen" ? "frozen at the full model" : "recomputed"}</td></tr>
+          <tr><td>Finest level</td><td>{c.depth}</td></tr>
+          <tr><td>Tests · model passes</td><td>{int(c.tests)} · {int(c.passes)}</td></tr>
+          <tr><td>Accepted · refused by the rerun</td><td>{int(c.commits)} · {int(c.refused)}</td></tr>
+          <tr><td>Time</td><td>{Math.round(c.seconds)} s</td></tr>
+        </tbody>
+      </table>
+      {c.stopped && <p className="np-error">The test budget ran out. Blocks that were not resolved stay whole in the circuit.</p>}
+      <div className="ap-voice">
+        <span className="np-caption">Search levels</span>
+        <table className="np-table ap-dose">
+          <thead><tr><th>Level</th><th>Kept</th><th>Atoms on</th><th>KL</th></tr></thead>
+          <tbody>
+            {c.levels.map((l) => (
+              <tr key={l.level} title={l.name}><td>{l.level <= 4 ? l.level : "final"}</td><td>{int(l.kept)}</td><td>{big(l.atoms)}</td><td>{num(l.kl, 4)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+        <p className="np-note">From whole blocks (1) through heads and neurons (2) and dimensions and keys (3) to single multiplications (4). The final step splits remaining blocks and tests every leaf alone.</p>
+      </div>
     </section>
   );
 }
@@ -278,6 +343,7 @@ export function Details({ job, result, neuron, runs, part, parent, metric, artif
       )}
 
       {neuron && <StaticNeuron n={neuron} />}
+      {result?.circuit && <CircuitSummary c={result.circuit} target={result.target?.id} />}
       {!!result?.output?.length && (
         <section className="np-section" style={{ ["--accent" as string]: "#3d9bff" }}>
           <span className="np-caption">Output of the real pass</span>
@@ -327,7 +393,7 @@ export function Details({ job, result, neuron, runs, part, parent, metric, artif
           <div className="ap-files">
             {artifacts.map((file) => (
               <a key={file} className="np-link" href={artifactUrl(job.id, file)} target={file.endsWith(".html") ? "_blank" : undefined} rel="noopener">
-                {file.endsWith(".html") ? file.replace(/^report_/, "Open report ").replace(/\.html$/, "").replaceAll("_", " ") : file === "atlas.apla" ? "Download neuron atlas" : file === "tokens.json" ? "Download token IDs" : file === "neuron-trace.json" ? "Download trace data" : "Download forward pass"}
+                {file.endsWith(".html") ? file.replace(/^report_/, "Open report ").replace(/\.html$/, "").replaceAll("_", " ") : file === "atlas.apla" ? "Download neuron atlas" : file === "tokens.json" ? "Download token IDs" : file === "neuron-trace.json" ? "Download trace data" : file === "circuit.json" ? "Download circuit data" : "Download forward pass"}
               </a>
             ))}
             {!!job.request.prompt && !["tokens", "dump"].includes(job.request.kind) && (

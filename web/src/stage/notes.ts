@@ -20,6 +20,11 @@ export const SPACE_NOTES: Record<string, Note> = {
     text: "The white point is the traced neuron. Each line leads back to a source of its activation: an earlier neuron, a head with the positions it reads, or the input.",
     reading: [["Place", "The source’s layer and token position."], ["Height", "Its share of the activation of the node it feeds."], ["Colour", "Neurons orange, heads and what they read blue, input white."], ["Depth", "Only the strongest sources are followed at every step."]],
   },
+  circuit: {
+    title: "The circuit in space",
+    text: "Layers run from left to right, token positions from front to back. The clouds on the floor show where scalar products stay switched on. Above them stand the leaves of the circuit. Drag to turn, scroll to zoom.",
+    reading: [["Floor", "Kept atoms per layer and position, denser where more are kept."], ["Height", "Target log-odds in the circuit minus without the leaf, removed alone."], ["Colour", "Attention blue, MLP orange, per-layer embedding violet."], ["Arcs", "Leaves that matter most, joined to the target."]],
+  },
   neuron: {
     title: "A neuron from its weights",
     text: "No prompt is involved. On the left is what the neuron reads, on the right what it writes into. Height and depth are the two numbers a source adds to the neuron’s computation.",

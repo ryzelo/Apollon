@@ -20,6 +20,7 @@ import { CHAIN_NOTES, NOTES, SPACE_NOTES } from "./stage/notes";
 import { Space } from "./stage/Space";
 import { Table } from "./stage/Table";
 import { modelScene } from "./space/model";
+import { circuitScene } from "./space/circuit";
 import { probeScene } from "./space/probe";
 import { traceScene } from "./space/trace";
 import { neuronScene } from "./space/neuron";
@@ -162,7 +163,7 @@ function App() {
     if (neuron) return neuronScene(neuron, layers);
     if (view !== "space" || !result || !components.length) return null;
     const r = viewResult!;
-    return mode === "probe" ? probeScene(r, metric) : mode === "trace" ? traceScene(r) : modelScene(r, metric, hidden, other);
+    return mode === "probe" ? probeScene(r, metric) : mode === "trace" ? traceScene(r) : mode === "circuit" ? circuitScene(r, hidden) : modelScene(r, metric, hidden, other);
   }, [neuron, layers, view, viewResult, components, mode, metric, hidden, other]);
 
   useEffect(() => { setQuery(""); setFilter(NO_FILTER); setBrush(null); setCompare(""); }, [ui.run]);
@@ -228,8 +229,10 @@ function App() {
   const rankBase = chain ? drawnUnits.map((u) => u.part) : components;
   const ranked = useMemo(() => [...rankBase].sort((a, b) => Math.abs(valueOf(b, metric) ?? 0) - Math.abs(valueOf(a, metric) ?? 0)), [rankBase, metric]);
   const rest = drawnUnits.find((u) => u.part.kind === "remainder")?.part as Detail | undefined;
-  const rankTitle = mode === "trace" ? `Strongest sources of ${components[0]?.label}` : mode === "probe" ? `Units of ${components.map((c) => c.label).join(", ")}` : "Strongest contributions";
-  const rankNote = mode === "trace"
+  const rankTitle = mode === "trace" ? `Strongest sources of ${components[0]?.label}` : mode === "probe" ? `Units of ${components.map((c) => c.label).join(", ")}` : mode === "circuit" ? "Blocks of the circuit" : "Strongest contributions";
+  const rankNote = mode === "circuit"
+    ? `Every layer’s attention, MLP and PLE steps that stay in the circuit. A value is the sum, over its leaves, of the target’s log-odds lost when that leaf alone is removed from the circuit. The ${Math.min(8, ranked.length)} largest of ${int(ranked.length)} blocks.`
+    : mode === "trace"
     ? `Each source’s share of the neuron’s activation of ${fmt((components[0] as Detail | undefined)?.activation)}.${rest ? ` The ${int(rest.count || 0)} remaining sources add ${fmt(rest.activation_contribution)}.` : ""}`
     : mode === "probe"
       ? `Change of the target’s log-odds when one unit is removed and the model reruns. The ${Math.min(8, ranked.length)} largest of ${int(ranked.length)} units.`

@@ -25,6 +25,7 @@ use crate::model::{Atoms, Checkpoint, Cut, HeadCut, KeyCut, LayerCut, LayerInput
 use crate::probe::{read_out_fz, Out, NY};
 use crate::readout::{columns, softmax};
 use crate::tensor::Mat;
+use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::IsTerminal;
@@ -43,6 +44,8 @@ pub struct Opts {
     pub show: usize,
     pub html: PathBuf,
     pub dump: Option<PathBuf>,
+    /// structured result for the web application (export schema 2, mode "circuit")
+    pub result_json: Option<PathBuf>,
     /// test mode: no search, a random cut with this seed (written with --dump-circuit)
     pub random: Option<u64>,
     /// every norm keeps the scale of the full model (default); false: norms recompute their scale
@@ -1705,18 +1708,62 @@ impl<'a> Engine<'a> {
 
 // ====================================================================== mean ablation
 
+/// A residual this many times the median RMS of its sequence (at the same norm) marks an attention sink
+const SINK_RMS: f32 = 3.0;
+
+/// The typical positions of a reference sequence: all except position 0 (the attention sink, whether
+/// <bos> or an ordinary first token) and every position whose residual, at some pre-norm of some layer,
+/// has more than SINK_RMS times the median RMS of the sequence there (later sinks such as " the" in
+/// SmolLM2). The pre-norm scale is 1/RMS, so this compares the recorded scales.
+fn typical_positions(ns: Option<&NormScales>, t: usize) -> Vec<usize> {
+    if t <= 1 {
+        return (0..t).collect();
+    }
+    let mut sink = vec![false; t];
+    sink[0] = true;
+    for ln in ns.map_or(&[][..], |n| &n.layers[..]) {
+        for sc in [&ln.attn, &ln.mlp] {
+            if sc.len() != t {
+                continue;
+            }
+            let mut v: Vec<f32> = sc.iter().copied().filter(|x| x.is_finite() && *x > 0.0).collect();
+            if v.is_empty() {
+                continue;
+            }
+            v.sort_by(|a, b| a.total_cmp(b));
+            let med = v[v.len() / 2];
+            for (p, &x) in sc.iter().enumerate() {
+                if x * SINK_RMS < med {
+                    sink[p] = true;
+                }
+            }
+        }
+    }
+    let pos: Vec<usize> = (0..t).filter(|&p| !sink[p]).collect();
+    // never empty: without a typical position keep everything but the first
+    if pos.is_empty() {
+        (1..t).collect()
+    } else {
+        pos
+    }
+}
+
 /// The means for mean ablation, per layer and position of the analyzed sequence (T positions).
 ///
 /// * With reference prompts (`--circuit-ref`, same format): position-wise – at position p the mean over
 ///   the references that have a position p, as is usual in circuit work (IOI and the like).
-/// * Without, or where no reference reaches p: the mean over all positions of the references (the
-///   analyzed sequence itself by default), except a leading special token.
+/// * Without, or where no reference reaches p: the mean over the typical positions of the references
+///   (the analyzed sequence itself by default; `typical_positions`). Attention sinks are left out: their
+///   massive activations (a few neurons at 50× their usual value) would dominate the mean, and replacing
+///   an atom of an ordinary row by it writes a sink-sized vector into that row. Live norms absorb that;
+///   frozen norms keep the row's scale and the MLPs amplify it layer by layer until the pass overflows.
 /// * A leading special token (<bos>) is context-free – the same activations in every sequence – so at
 ///   position 0 its own activations are the mean: switching off atoms there changes nothing.
 ///
 /// Means are taken of the inputs of every matrix product and of the factors of QKᵀ and A·V (q after norm
 /// and RoPE, k, v, the attention weights per query/key position; for the weights the fallback is the
-/// mean weight on <bos> or on any other key). W·x̄ is precomputed for the row-wise sites.
+/// mean weight on key 0 – the first sink, <bos> or not – or on any other typical key). W·x̄ is
+/// precomputed for the row-wise sites.
 /// Returns the means and, per reference, the positions it contributed to the fallback.
 fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32], positionwise: bool) -> (Means, Vec<Vec<usize>>) {
     let (nl, d, t) = (g.layers.len(), g.d, ids.len());
@@ -1734,7 +1781,7 @@ fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32]
         q: Vec<f64>,
         k: Vec<f64>,
         v: Vec<f64>,
-        /// position slots [nh][t]; global slot [nh][2] = on <bos>, on any other key
+        /// position slots [nh][t]; global slot [nh][2] = on key 0, on any other typical key
         a: Vec<f64>,
         an: Vec<f64>,
         n: f64,
@@ -1751,9 +1798,14 @@ fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32]
     let mut used = Vec::new();
     for r in refs {
         let rt = r.len();
-        let tr = m.run(r, rt - 1, &RunOpts { record_inputs: true, ..Default::default() });
+        let tr = m.run(r, rt - 1, &RunOpts { record_inputs: true, record_norms: true, ..Default::default() });
         let start = usize::from(rt > 1 && m.tok.is_special(r[0]));
-        used.push((start..rt).collect::<Vec<_>>());
+        let typ = typical_positions(tr.norms.as_ref(), rt);
+        let mut typical = vec![false; rt];
+        for &p in &typ {
+            typical[p] = true;
+        }
+        used.push(typ);
         for (l, li) in tr.inputs.iter().enumerate() {
             let lg = &g.layers[l];
             let (nh, hd) = (lg.nh, lg.hd);
@@ -1764,7 +1816,7 @@ fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32]
                 if p < t && (positionwise || (p == 0 && bos && start == 1)) {
                     slots.push(p);
                 }
-                if p >= start {
+                if typical[p] {
                     slots.push(t);
                 }
                 for &sl in &slots {
@@ -1799,8 +1851,9 @@ fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32]
                             a.an = vec![0.0; nh * 2];
                         }
                         for h in 0..nh {
-                            for j in g.keys(l, p) {
-                                let c = usize::from(!(j == 0 && start == 1));
+                            // key 0 is the first sink; later sinks are left out like their queries
+                            for j in g.keys(l, p).filter(|&j| j == 0 || typical[j]) {
+                                let c = usize::from(j != 0);
                                 a.a[h * 2 + c] += li.probs[(p * nh + h) * rt + j] as f64;
                                 a.an[h * 2 + c] += 1.0;
                             }
@@ -1833,7 +1886,7 @@ fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32]
                 ..Default::default()
             };
             // attention weights: of this query position where known, else the global mean weight on
-            // <bos> / on any other key
+            // key 0 / on any other typical key
             pm.a = vec![0f32; nh * t];
             for h in 0..nh {
                 for j in 0..t {
@@ -1841,7 +1894,7 @@ fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32]
                     pm.a[h * t + j] = if known {
                         (a.a[h * t + j] / a.an[h * t + j]) as f32
                     } else {
-                        let c = usize::from(!(j == 0 && bos));
+                        let c = usize::from(j != 0);
                         (glob.a.get(h * 2 + c).copied().unwrap_or(0.0) / glob.an.get(h * 2 + c).copied().unwrap_or(1.0).max(1.0)) as f32
                     };
                 }
@@ -2077,6 +2130,9 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     if let Some(f) = &o.dump {
         std::fs::write(f, dump_json(&r, &full.logits)).map_err(|x| format!("{}: {x}", f.display()))?;
         println!("{}", st.dim(&format!("JSON: {}", f.display())));
+    }
+    if let Some(f) = &o.result_json {
+        crate::export::write(f, &result_json(&r, &full.logits))?;
     }
     Ok(())
 }
@@ -2403,7 +2459,7 @@ fn ablation_txt(r: &Report) -> String {
     if r.o.mean {
         format!(
             "mean ablation: the activations in a switched-off atom are replaced by their means over {} (<bos> stays itself)",
-            if r.o.refs.is_empty() { "all positions of the analyzed sequence (--circuit-ref gives reference prompts)".to_string() } else { format!("{} reference prompts, position by position", r.refs.len()) }
+            if r.o.refs.is_empty() { "the typical positions of the analyzed sequence, attention sinks left out (--circuit-ref gives reference prompts)".to_string() } else { format!("{} reference prompts, position by position", r.refs.len()) }
         )
     } else {
         "zero ablation: a switched-off atom is missing from its sum".into()
@@ -2571,6 +2627,126 @@ fn short(v: u64) -> String {
     } else {
         format!("{}M", v / 1_000_000)
     }
+}
+
+/// The family and kind of a piece as the web application names them, and the unit it stands for.
+fn piece_kind(pc: &Piece) -> (&'static str, &'static str, Option<u32>) {
+    let site_family = |s: Site| match s {
+        Site::Q | Site::K | Site::V | Site::O => "attention",
+        Site::Gate | Site::Up | Site::Down => "mlp",
+        Site::PleIn | Site::PleGate | Site::PleProj => "ple",
+    };
+    let one = |v: &Ids| if v.len() == 1 { Some(v[0]) } else { None };
+    match pc {
+        Piece::Attn { .. } => ("attention", "attention", None),
+        Piece::Kv { .. } => ("attention", "attention kv", None),
+        Piece::Mlp { .. } => ("mlp", "mlp", None),
+        Piece::Ple { .. } => ("ple", "ple", None),
+        Piece::Heads { h, .. } => ("attention", if h.len() == 1 { "head" } else { "attention unit" }, one(h)),
+        Piece::KvGroups { .. } | Piece::Keys { .. } | Piece::KeyDims { .. } => ("attention", "attention unit", None),
+        Piece::Neurons { n, .. } => ("mlp", if n.len() == 1 { "neuron" } else { "mlp unit" }, one(n)),
+        Piece::PleDims { .. } => ("ple", "ple unit", None),
+        Piece::Units { s, .. } | Piece::Atoms { s, .. } => {
+            let f = site_family(*s);
+            (f, match f { "attention" => "attention unit", "mlp" => "mlp unit", _ => "ple unit" }, None)
+        }
+    }
+}
+
+/// The structured result for the web application: the leaves grouped by layer and family (their value is
+/// the target's log-odds in the circuit minus without the leaf), and everything the report shows besides.
+fn result_json(r: &Report, full_logits: &[f32]) -> Value {
+    let e = r.e;
+    let m = e.m;
+    let probs = |o: &Out| json!(o.top.iter().map(|&(id, p)| json!({"id": id, "text": m.tok.piece(id), "probability": p})).collect::<Vec<_>>());
+    let out = |o: &Out| json!({"top": probs(o), "target_log_odds": o.lo[0], "kl": o.kl});
+    let mut result = crate::export::result(m, r.ids, r.focus, e.ys[0], "circuit", &crate::model::top_probs(full_logits, 10));
+    result["rival"] = json!({"id": e.ys[1], "text": m.tok.piece(e.ys[1]), "from_contrast_prompt": false});
+    // components: one per layer and family, their children the leaves (most necessary first, at most LIMIT)
+    const LIMIT: usize = 3000;
+    let base = r.circuit_out.lo[0];
+    let mut groups: BTreeMap<(usize, usize), Vec<Value>> = BTreeMap::new();
+    let order = |f: &str| match f {
+        "attention" => 0,
+        "mlp" => 1,
+        _ => 2,
+    };
+    for (i, lf) in r.leaves.iter().enumerate().take(LIMIT) {
+        let (l, p) = lf.piece.lp();
+        let (family, kind, unit) = piece_kind(&lf.piece);
+        let without: Vec<Value> = lf.out.top.iter().map(|&(id, pr)| json!({"id": id, "text": m.tok.piece(id), "probability": pr})).collect();
+        groups.entry((l, order(family))).or_default().push(json!({
+            "id": format!("leaf-{i}"), "label": lf.piece.name(m), "layer": l, "kind": kind, "unit": unit,
+            "position": p, "direct": null, "total": base - lf.out.lo[0], "kl": lf.out.kl,
+            "count": lf.piece.n_atoms(&e.g), "activation": lf.value, "output_without": without,
+        }));
+    }
+    let names = ["Attn", "MLP", "PLE"];
+    let families = ["attention", "mlp", "ple"];
+    let components: Vec<Value> = groups
+        .into_iter()
+        .map(|((l, f), children)| {
+            let total: f64 = children.iter().filter_map(|c| c["total"].as_f64()).sum();
+            let atoms: u64 = children.iter().filter_map(|c| c["count"].as_u64()).sum();
+            json!({"id": format!("S{l}-{}", families[f]), "label": format!("S{l} {}", names[f]), "layer": l,
+                "kind": families[f], "direct": null, "total": total, "count": atoms, "children": children})
+        })
+        .collect();
+    result["components"] = json!(components);
+    // atoms on per layer and position (attention = Q, O, QKᵀ, A·V · K/V · MLP · PLE)
+    let g = &e.g;
+    let mut cells = Vec::new();
+    for p in 0..=g.focus {
+        for l in 0..g.layers.len() {
+            let k = e.cell_kept(p, l);
+            let v = [
+                k[Site::Q as usize] + k[Site::O as usize] + k[N_SITES] + k[N_SITES + 1],
+                k[Site::K as usize] + k[Site::V as usize],
+                k[Site::Gate as usize] + k[Site::Up as usize] + k[Site::Down as usize],
+                k[Site::PleIn as usize] + k[Site::PleGate as usize] + k[Site::PleProj as usize],
+            ];
+            if v.iter().any(|&x| x > 0) {
+                cells.push(json!({"layer": l, "position": p, "attention": v[0], "kv": v[1], "mlp": v[2], "ple": v[3]}));
+            }
+        }
+    }
+    let layers: Vec<Value> = layer_rows(e)
+        .into_iter()
+        .filter(|(_, on, _, _)| on.iter().any(|&x| x > 0))
+        .map(|(l, on, tot, units)| {
+            json!({"layer": l, "on": {"attention": on[0], "kv": on[1], "mlp": on[2], "ple": on[3]},
+                "total": {"attention": tot[0], "kv": tot[1], "mlp": tot[2], "ple": tot[3]}, "units": units})
+        })
+        .collect();
+    let levels: Vec<Value> = r
+        .logs
+        .iter()
+        .map(|lg| {
+            json!({"level": lg.level, "name": level_name(lg.level), "groups": lg.groups, "pieces_in": lg.pieces_in,
+                "kept": lg.kept, "unresolved": lg.unresolved, "atoms": lg.atoms, "kl": lg.kl, "tests": lg.tests,
+                "passes": lg.passes, "seconds": lg.secs})
+        })
+        .collect();
+    let s = &e.st;
+    result["circuit"] = json!({
+        "criterion_kl": r.o.kl, "depth": r.o.depth.clamp(1, 4),
+        "ablation": if r.o.mean { "mean" } else { "zero" }, "ablation_text": ablation_txt(r),
+        "norms": if r.o.frozen { "frozen" } else { "live" }, "norms_text": norms_txt(r.o.frozen),
+        "reference_sequences": r.refs.len(), "reference_positions": r.ref_pos.iter().map(|p| p.len()).sum::<usize>(),
+        "atoms_kept": e.atoms_kept(), "atoms_total": r.total_atoms, "leaves": r.leaves.len(), "leaves_listed": r.leaves.len().min(LIMIT),
+        "full": out(&r.full_out), "circuit": out(&r.circuit_out), "complement": out(&r.comp_out),
+        "levels": levels, "layers": layers, "cells": cells,
+        "tests": s.tests, "passes": s.passes, "commits": s.commits, "refused": s.refused, "seconds": s.secs, "stopped": s.stopped,
+    });
+    result["checks"] = json!([
+        {"label": "Empty cut = normal pass (bit-identical)", "deviation": if r.empty_identical { 0.0 } else { 1.0 }, "passed": r.empty_identical},
+        {"label": "Batch vs. standalone rerun of accepted steps |ΔKL|", "deviation": s.batch_dev},
+        {"label": "Clean rows in the batches vs. base |ΔKL|", "deviation": s.clean_dev},
+        {"label": "Atoms without effect switched off, output bit-identical", "deviation": if s.dead_identical { 0.0 } else { 1.0 }, "passed": s.dead_identical},
+    ]);
+    result["metric"] = json!("target_log_odds_in_circuit_minus_without_leaf");
+    result["report"] = json!(r.o.html.file_name().map(|x| x.to_string_lossy().to_string()));
+    result
 }
 
 /// Everything the reference test needs: tokens, the cut cell by cell, logits of the full model, the

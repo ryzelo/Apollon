@@ -8,12 +8,21 @@ const FORM_KINDS: { id: Kind; label: string; text: string }[] = [
   { id: "decompose", label: "Decompose", text: "Split the prediction of one answer token into the contributions of every layer." },
   { id: "probe", label: "Probe", text: "Switch the units of one component off one by one and rerun the model." },
   { id: "trace", label: "Trace", text: "Follow one neuron’s activation back to the sources that feed it." },
+  { id: "circuit", label: "Circuit", text: "Search the smallest set of computation steps that still keeps the prediction, from whole blocks down to single multiplications. Every accepted step is checked by rerunning the model. This can take minutes." },
   { id: "neuron", label: "Static", text: "What one neuron reads and writes, from its weights alone. No prompt needed." },
 ];
 const OPTIONS: Partial<Record<Kind, [string, string, string][]>> = {
   decompose: [["top", "Sources per component", "8"]],
   probe: [["probe-pos", "Intervention position", "Automatic"], ["probe-max", "Maximum distributed units", "1024"], ["depth", "Units to examine in detail", "6"], ["contrast", "Contrast prompt", "For example: What is 2+3?"]],
   trace: [["trace-depth", "Trace depth", "2"], ["trace-top", "Sources per node", "3"], ["scalars", "Scalar products shown", "10"], ["scalars-of", "Scalar products for source", "S14 head 1 @16"]],
+  circuit: [["circuit-kl", "Allowed change of the output (KL, nats)", "0.1"], ["circuit-depth", "Finest level, 1 = blocks … 4 = single multiplications", "4"], ["circuit-tests", "Test budget", "2000000"]],
+};
+/** Choices with a fixed list of values: [option, label, [value, text][], note]. The empty value is the engine's default. */
+const CHOICES: Partial<Record<Kind, [string, string, [string, string][], string][]>> = {
+  circuit: [
+    ["circuit-ablation", "Removed steps are replaced by", [["", "Their mean (default)"], ["zero", "Zero"]], "The mean is taken over the reference prompts below, or over this prompt."],
+    ["circuit-norms", "Normalization during interventions", [["", "Frozen at the full model (default)"], ["live", "Recomputed from what is left"]], "Recomputing lets a small rest be scaled up to full size."],
+  ],
 };
 
 export type Draft = Partial<Request> & { kind: Kind };
@@ -115,6 +124,29 @@ export function Form({ draft, models, runs, online, onClose, onLaunch }: {
               <span className="np-note">An atlas stores each neuron’s strongest weight connections. <button type="button" className="np-link" disabled={!model.trim() || submitting} onClick={() => void send({ model, kind: "atlas", prompt: "", answer: 1, options: {} })}>Build one for this model</button></span>
             </label>
           )}
+          {(CHOICES[kind] || []).map(([key, label, values, note]) => (
+            <label key={key} className="ap-label">{label}
+              <select className="np-select" value={options[key] || ""} onChange={(e) => setOptions((old) => ({ ...old, [key]: e.target.value }))}>
+                {values.map(([v, text]) => <option key={v} value={v}>{text}</option>)}
+              </select>
+              <span className="np-note">{note}</span>
+            </label>
+          ))}
+          {kind === "circuit" && options["circuit-ablation"] !== "zero" && (
+            <label className="ap-label">Reference prompts <span className="ap-quiet">optional</span>
+              <textarea className="np-textarea" rows={2} value={options["circuit-ref"] || ""} placeholder="3+5=; 7+1=; 4+4=" onChange={(e) => setOptions((old) => ({ ...old, "circuit-ref": e.target.value }))} />
+              <span className="np-note">Separate several with “;”. Prompts in the same format, for example other additions, give the means removed steps are replaced by.</span>
+            </label>
+          )}
+          <label className="ap-label">Matrix products on
+              <select className="np-select" value={options.gpu || ""} onChange={(e) => setOptions((old) => ({ ...old, gpu: e.target.value }))}>
+                <option value="">Automatic (default)</option>
+                <option value="metal">GPU · Metal (Apple Silicon)</option>
+                <option value="cuda">GPU · CUDA (NVIDIA)</option>
+                <option value="off">CPU only</option>
+              </select>
+              <span className="np-note">Automatic uses Metal on a Mac, CUDA when an NVIDIA driver is found, otherwise the CPU.</span>
+            </label>
           {kind === "decompose" && (
             <label className="np-field">Intervene only at the focus position
               <input className="np-switch" type="checkbox" checked={options["focus-only"] === "true"} onChange={(e) => setOptions((old) => ({ ...old, "focus-only": String(e.target.checked) }))} />

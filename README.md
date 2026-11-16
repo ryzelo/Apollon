@@ -284,8 +284,11 @@ default 0.1 nats) and **the same top token**.
     `--chat` and completed with their own greedy answer – the means are taken **position by position**: at
     position p over the references at position p (as in IOI-style work). The circuit then is what carries
     the *difference* to the references – with other numbers, the numbers.
-  * Without references (or where no reference reaches a position), the mean over all positions of the
-    analyzed sequence is used.
+  * Without references (or where no reference reaches a position), the mean over the typical positions of
+    the analyzed sequence (or the references) is used. Attention sinks are left out of it: the first position
+    (`<bos>` or not) and every position whose residual is more than 3× the median RMS of its sequence at some
+    layer (massive activations, e.g. " the" in SmolLM2). Their activations, a few neurons at 50× their usual
+    value, would dominate the mean, and with frozen norms that blows up the pass (the complement gave NaN).
   * A leading `<bos>` stays itself: it is the same in every sequence (and an attention sink), so its mean is
     its own activations.
 * **zero**: a switched-off atom is missing from its sum. This takes the model further off its usual
