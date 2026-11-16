@@ -33,13 +33,17 @@ The parts always add up to the real forward pass, and apollon checks this in eve
 
 | | |
 |---|---|
-| `--decompose` | Splits the prediction into the contribution of every attention, MLP and embedding, down to heads and neurons, with direct and total effect. |
-| `--probe` | Switches off every unit of one component (neurons, heads) and follows the effect to the output. |
-| `--trace` / `--neuron` / `--atlas` | Takes one neuron apart down to single scalar products, and maps what every neuron can do. |
-| `--circuit` | Finds the minimal circuit the prediction needs, down to single scalar products. |
-| `--serve` | A local web workspace with 3D, flow, unit and table views. |
+| `--decompose` | Splits the prediction into the contribution of the embedding and every attention and MLP (and per-layer embedding in Gemma 4), down to single heads, the positions they read, and single neurons. Shows what each part says on its own (direct effect) and what changes when it is removed and the model rerun (total effect). |
+| `--probe` | A test bench for one component: switches off every neuron, head or embedding dimension in it, finds where it acts, how many units carry the function, how the answer reacts to stronger or weaker activations, and, with `--contrast`, whether it carries the information that differs between two prompts. |
+| `--trace` | Takes one neuron apart at one prediction, down to single scalar products, and follows its inputs backwards through earlier neurons, heads and positions. `--trace auto` picks the most important neurons. |
+| `--neuron` | Everything one neuron *can* do, without a prompt: its strongest and weakest possible activation, the input that triggers it, and its static inputs and outputs. |
+| `--atlas` | The same for every neuron of a model, saved in one file that `--trace` can use. |
+| `--circuit` | Finds a minimal circuit for a prediction: switches off everything the answer does not need, down to single scalar products, with mean or zero ablation and optional reference prompts. |
+| `--serve` | A local web workspace for all of the above (see below). |
 
-Matrix products run on the GPU when there is one (Metal on macOS, CUDA on NVIDIA), otherwise on the CPU.
+Every analysis checks itself in every run and reports any violation. Matrix products run on the GPU when there is
+one (Metal on macOS, CUDA on NVIDIA), otherwise on the CPU; `--gpu auto|metal|cuda|off` chooses, and
+`--selftest-gpu` compares the GPU against the CPU.
 
 ## Installation
 
@@ -78,8 +82,21 @@ apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --trace "S16 #2328
 apollon -m EleutherAI/pythia-14m --pos -1 --circuit "Monday, Tuesday, Wednesday,"
 ```
 
-Every analysis prints a report in the terminal and writes an interactive HTML report.
-`apollon --help` lists all options.
+Every analysis prints a report in the terminal and writes an interactive HTML report. `apollon --help` lists all
+options; the most important ones:
+
+| Option | Meaning |
+|---|---|
+| `-m MODEL` | Ollama name (`qwen2.5:3b`), Hugging Face name (`EleutherAI/pythia-70m`), `.gguf` file or model folder |
+| `--chat` | wrap the prompt in the model's chat format (Gemma 3/4, ChatML) |
+| `--answer N` | analyze the N-th token of the model's answer (`--answer 1,6` for several) |
+| `--pos N` | analyze the prediction at prompt position N instead (negative counts from the end) |
+| `--target " Paris"` | the token to explain (default: the predicted one) |
+| `--html NAME` | base name of the HTML reports |
+| `--result-json FILE` | export the analysis as structured JSON |
+| `--dump FILE` | write the tokens, the residual stream after every layer and the logits |
+
+Without an analysis flag, apollon just generates the answer.
 
 ### Web workspace
 
@@ -89,7 +106,10 @@ cd web && npm ci && npm run build && cd ..
 ```
 
 Then open http://127.0.0.1:8765, pick a model, write a prompt, and click on any answer token to take its
-prediction apart. The server listens only on your own machine.
+prediction apart. From there, one click probes a component, traces a neuron or inserts a contrast prompt. Every
+result can be viewed as a 3D space, a flow, a unit view or a table; runs can be compared side by side, parts
+pinned across runs, and every view shared as a link. Runs and reports are kept between sessions. The server
+listens only on your own machine.
 
 ## Supported models
 
