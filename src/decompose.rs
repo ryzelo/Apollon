@@ -26,6 +26,7 @@ use std::time::Instant;
 const NS: usize = 64;
 
 pub struct Opts {
+    pub result_json: Option<PathBuf>,
     pub focus_only: bool,
     pub html: PathBuf,
     /// sources shown per head and neurons per MLP
@@ -597,6 +598,68 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     let secs = t0.elapsed().as_secs_f32();
     let checks = Checks { last_dev, stream_dev, logit_dev, zmax, kl_product, source_dev, rerun_dev, n_reruns, secs_reruns, secs_voices, secs, n_voices: n - 1 };
     let ctx = Ctx { m, ids, tr: &tr, focus, parts: &parts, changes: &changes, e: &e, ys: &ys, p: &p, o, hmax: (v as f32).log2(), checks: &checks };
+    if let Some(path) = &o.result_json {
+        use serde_json::json;
+        let mut result = crate::export::result(m, ids, focus, y0, "decompose", &top);
+        let node = |i: usize| {
+            let part = &parts.parts[i];
+            let kind = match part.kind {
+                Kind::Embedding => "embedding", Kind::Attn => "attention", Kind::Mlp => "mlp", Kind::Ple => "ple",
+                Kind::Head(_) => "head", Kind::Neuron(..) => "neuron", Kind::Source(..) => "source",
+                Kind::OtherNeurons(_) | Kind::OtherSources(..) => "remainder", _ => "bias",
+            };
+            let total = if part.kind.is_change() { effects(&e, i, part.change, 0).1 } else { None };
+            let unit = match part.kind { Kind::Neuron(n, _) => Some(n as usize), Kind::Head(h) => Some(h as usize), _ => None };
+            let position = match part.kind { Kind::Source(_, pos) => Some(pos), _ => None };
+            let mut item = json!({"id":format!("part-{i}"),"label":name(m,ids,part),"layer":part.l,"kind":kind,
+                "direct":e.voices[i].dlo[0],"total":total,"children":[],"unit":unit,"position":position,
+                "voice":crate::export::probabilities(m,&e.voices[i].top),
+                "voice_entropy_bits":e.voices[i].h,"direct_kl":e.voices[i].kl});
+            if part.kind.is_change() {
+                let shift = |g: &[Shift]| g.iter().map(|&(id, without, with)| json!({
+                    "id":id,"text":m.tok.piece(id),"without":without,"with":with})).collect::<Vec<_>>();
+                let (gains, losses) = shifts(&e, part.change, i);
+                item["raises"] = json!(shift(gains));
+                item["lowers"] = json!(shift(losses));
+                item["direct_share"] = json!(direct_share(&e, part.change));
+                if let Some(w) = &e.effects[part.change] {
+                    item["kl"] = json!(w.kl);
+                    item["output_without"] = json!(crate::export::probabilities(m, &w.top_without));
+                }
+                item["indirect_norm"] = json!(e.norm_part[part.change].map(|v| v[0]));
+            }
+            if let Kind::Head(h) = part.kind {
+                let (pf, tt) = (&tr.attn_focus[part.l], ids.len());
+                item["attention"] = json!((0..tt).map(|j| pf[h as usize * tt + j]).collect::<Vec<_>>());
+            }
+            item
+        };
+        let components: Vec<_> = changes.iter().map(|&i| {
+            let mut item = node(i);
+            let indices = &e.children[parts.parts[i].change];
+            let children: Vec<_> = indices.iter().filter(|&&j| !matches!(parts.parts[j].kind, Kind::Source(..) | Kind::OtherSources(..))).map(|&j| {
+                let mut child = node(j);
+                if let Kind::Head(head) = parts.parts[j].kind {
+                    let sources: Vec<_> = indices.iter().filter(|&&k| matches!(parts.parts[k].kind, Kind::Source(h, _) | Kind::OtherSources(h, _) if h == head)).map(|&k| node(k)).collect();
+                    child["children"] = json!(sources);
+                }
+                child
+            }).collect();
+            item["children"] = json!(children);
+            item
+        }).collect();
+        result["components"] = json!(components);
+        result["checks"] = json!([
+            {"label":"Residual reconstruction", "deviation":stream_dev},
+            {"label":"Logit reconstruction", "deviation":logit_dev},
+            {"label":"Distribution reconstruction KL", "deviation":kl_product},
+            {"label":"Attention source reconstruction", "deviation":source_dev},
+            {"label":"Unchanged rerun", "deviation":rerun_dev}
+        ]);
+        result["intervention_scope"] = json!(if o.focus_only { "focus" } else { "all_positions" });
+        result["report"] = json!(o.html.file_name().map(|x| x.to_string_lossy().to_string()));
+        crate::export::write(path, &result)?;
+    }
     terminal(&ctx, st);
     let html = html(&ctx);
     std::fs::write(&o.html, html).map_err(|er| format!("{}: {er}", o.html.display()))?;

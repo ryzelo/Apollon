@@ -5,6 +5,8 @@
 //! --probe      brute-force test bench for one component (neurons, PLE dimensions or heads)
 //! --circuit    exact circuit search down to single scalar products
 mod atlas;
+mod export;
+mod server;
 mod blas;
 mod circuit;
 mod decompose;
@@ -115,6 +117,9 @@ Options:
                    is found, else CPU), metal, cuda, off. Also via $APOLLON_GPU. CUDA needs no build
                    option: the driver and NVRTC are loaded at runtime
   --color / --no-color
+  --result-json F  export one runtime analysis as structured JSON
+  --models-json    list discovered models as JSON
+  --serve          start the local web application
   --threads N
 
 For the reference tests:
@@ -136,6 +141,9 @@ struct Args {
     color: Option<bool>,
     threads: Option<usize>,
     list: bool,
+    models_json: bool,
+    serve: bool,
+    result_json: Option<PathBuf>,
     dump: Option<String>,
     tokens_only: bool,
     chat: bool,
@@ -195,6 +203,9 @@ fn parse_args() -> Result<Args, String> {
             // internal: GPU against CPU for every weight format and every matrix of the model
             "--selftest-gpu" => a.selftest_gpu = true,
             "--list" => a.list = true,
+            "--models-json" => a.models_json = true,
+            "--serve" => a.serve = true,
+            "--result-json" => a.result_json = Some(PathBuf::from(val(&x)?)),
             "--dump" => a.dump = Some(val(&x)?),
             "--tokens-only" => a.tokens_only = true,
             "--chat" => a.chat = true,
@@ -264,13 +275,19 @@ fn parse_args() -> Result<Args, String> {
             _ => a.prompt.push(x),
         }
     }
+    if a.result_json.is_some() {
+        let modes = usize::from(a.decompose) + usize::from(!a.probe.is_empty()) + usize::from(!a.trace.is_empty());
+        if modes > 1 || a.answer.len() > 1 || a.neuron.len() > 1 || (modes > 0 && !a.neuron.is_empty()) || a.dump.is_some() || a.tokens_only || (a.atlas.is_some() && a.trace.is_empty()) {
+            return Err("--result-json accepts one runtime analysis and one answer position per invocation".into());
+        }
+    }
     Ok(a)
 }
 
 // ---------------------------------------------------------------------- finding models
 
 fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+    PathBuf::from(std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into()))
 }
 fn ollama_root() -> PathBuf {
     std::env::var("OLLAMA_MODELS").map(PathBuf::from).unwrap_or_else(|_| home().join(".ollama/models"))
@@ -374,8 +391,9 @@ fn load(spec: &str) -> Result<Model, String> {
     }
 }
 
-fn list() {
-    println!("Ollama ({}):", ollama_root().display());
+fn list(as_json: bool) {
+    let mut models = Vec::new();
+    if !as_json { println!("Ollama ({}):", ollama_root().display()); }
     let man = ollama_root().join("manifests/registry.ollama.ai");
     let mut found = Vec::new();
     if let Ok(ns) = std::fs::read_dir(&man) {
@@ -393,9 +411,10 @@ fn list() {
     for f in &found {
         let arch = ollama_blob(f).and_then(|b| gguf::open(&b).ok()).and_then(|g| g.meta.get("general.architecture").and_then(|v| v.s().map(String::from)));
         let ok = matches!(arch.as_deref(), Some("llama" | "qwen2" | "qwen3" | "mistral" | "gemma4"));
-        println!("  {} {f}  ({})", if ok { "✓" } else { "✗" }, arch.unwrap_or("?".into()));
+        models.push(serde_json::json!({"id":f,"name":f,"supported":ok,"architecture":arch}));
+        if !as_json { println!("  {} {f}  ({})", if ok { "✓" } else { "✗" }, arch.unwrap_or("?".into())); }
     }
-    println!("Hugging Face ({}):", hf_root().display());
+    if !as_json { println!("Hugging Face ({}):", hf_root().display()); }
     let mut hs: Vec<String> = std::fs::read_dir(hf_root())
         .into_iter()
         .flatten()
@@ -418,9 +437,10 @@ fn list() {
         };
         let fam = why.trim_end_matches("_text");
         let ok = files.is_ok() && matches!(fam, "llama" | "mistral" | "qwen2" | "qwen3" | "gpt_neox" | "gpt_neo" | "gemma3" | "gemma4" | "roberta" | "bert" | "xlm-roberta");
-        println!("  {} {n}  ({why})", if ok { "✓" } else { "✗" });
+        models.push(serde_json::json!({"id":n,"name":n,"supported":ok,"architecture":why}));
+        if !as_json { println!("  {} {n}  ({why})", if ok { "✓" } else { "✗" }); }
     }
-    println!("✓ = architecture is supported");
+    if as_json { println!("{}", serde_json::json!({"models":models})); } else { println!("✓ = architecture is supported"); }
 }
 
 /// Short description of the architecture (identical layers grouped)
@@ -472,6 +492,7 @@ fn describe(m: &Model) -> String {
 }
 
 fn term_width() -> usize {
+    #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 20 {
@@ -586,16 +607,42 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
     }
     let base = a.html.clone().unwrap_or_else(|| "apollon".into());
     let one = |seq: &[u32], f: usize, suffix: String, contrast: Option<Vec<u32>>| -> Result<(), String> {
-        for part in &a.probe {
+        let mut probe_result: Option<serde_json::Value> = None;
+        for (index, part) in a.probe.iter().enumerate() {
             let po = probe::Opts {
                 part: part.clone(),
+                result_json: a.result_json.clone(),
                 pos: a.probe_pos,
-                html: PathBuf::from(format!("{base}_probe_{}{suffix}.html", part.replace(' ', "_"))),
+                html: PathBuf::from(format!("{base}_probe_{}{suffix}.html", part.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>())),
                 n_deep: a.depth.unwrap_or(6),
                 max: a.probe_max.unwrap_or(1024),
             };
             probe::run(m, seq, f, target, contrast.as_deref(), &po, style)?;
+            if let Some(path) = &a.result_json {
+                let mut result: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                fn prefix_ids(part: &mut serde_json::Value, index: usize) {
+                    if let Some(id) = part["id"].as_str() {
+                        part["id"] = serde_json::json!(format!("probe-{index}-{id}"));
+                    }
+                    if let Some(children) = part["children"].as_array_mut() {
+                        for child in children { prefix_ids(child, index); }
+                    }
+                }
+                if let Some(parts) = result["components"].as_array_mut() {
+                    for part in parts { prefix_ids(part, index); }
+                }
+                if let Some(combined) = &mut probe_result {
+                    for key in ["components", "checks"] {
+                        if let (Some(items), Some(more)) = (combined[key].as_array_mut(), result[key].as_array_mut()) {
+                            items.append(more);
+                        }
+                    }
+                } else {
+                    probe_result = Some(result);
+                }
+            }
         }
+        if let (Some(path), Some(result)) = (&a.result_json, probe_result) { export::write(path, &result)?; }
         if !a.trace.is_empty() {
             let mut neurons = Vec::new();
             for t in &a.trace {
@@ -609,6 +656,7 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
             }
             let o = trace::Opts {
                 neurons,
+                result_json: a.result_json.clone(),
                 depth: a.trace_depth.unwrap_or(2),
                 top: a.trace_top.unwrap_or(3),
                 scalars: a.scalars.unwrap_or(10),
@@ -635,7 +683,7 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
             circuit::run(m, seq, f, target, &o, style)?;
         }
         if a.decompose {
-            let o = decompose::Opts { focus_only: a.focus_only, html: PathBuf::from(format!("{base}_decompose{suffix}.html")), k: a.top.unwrap_or(8) };
+            let o = decompose::Opts { result_json: a.result_json.clone(), focus_only: a.focus_only, html: PathBuf::from(format!("{base}_decompose{suffix}.html")), k: a.top.unwrap_or(8) };
             decompose::run(m, seq, f, target, &o, style)?;
         }
         Ok(())
@@ -651,7 +699,13 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
         Ok(Some(m.tok.encode(&(wrap(g)? + &atext))))
     };
     if a.pos.is_some() {
-        let g = contrast_seq(&[])?.map(|g| g[..=focus.min(g.len() - 1)].to_vec());
+        let g = contrast_seq(&[])?.map(|mut g| {
+            g.truncate(focus + 1);
+            g
+        });
+        if g.as_ref().is_some_and(|g| g.len() != focus + 1) {
+            return Err("The contrast prompt does not reach the selected position".into());
+        }
         return one(&ids[..=focus], focus, String::new(), g);
     }
     let ks = if a.answer.is_empty() { vec![1] } else { a.answer.clone() };
@@ -661,6 +715,9 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
     print_answer(m, &ans, style);
     for &k in &ks {
         if k > ans.len() + 1 {
+            if a.result_json.is_some() {
+                return Err(format!("there is no answer token {k} (the answer ends after {} tokens)", ans.len()));
+            }
             eprintln!("there is no answer token {k} (the answer ends after {} tokens)", ans.len());
             continue;
         }
@@ -682,6 +739,12 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
             }
         }
         one(&seq, f, suffix, g)?;
+        if let Some(path) = &a.result_json {
+            let mut result: serde_json::Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            result["generated"] = serde_json::json!(export::tokens(m, &ans));
+            result["answer"] = serde_json::json!(ans.iter().map(|id| m.tok.piece(*id)).collect::<String>());
+            export::write(path, &result)?;
+        }
     }
     Ok(())
 }
@@ -720,7 +783,7 @@ fn statics(m: &Model, a: &Args, style: &Style) -> Result<(), String> {
         match neuron::parse_part(t).map_err(|e| format!("--neuron {e}"))? {
             neuron::PartSpec::Neuron(l, i) => {
                 let html = PathBuf::from(format!("{base}_neuron_S{l}_{i}.html"));
-                inspect::run(m, l, i, &inspect::Opts { k: a.top.unwrap_or(8) }, &html, style)?;
+                inspect::run(m, l, i, &inspect::Opts { k: a.top.unwrap_or(8) }, &html, a.result_json.as_deref(), style)?;
             }
             _ => return Err(format!("--neuron '{t}': give a neuron like \"S12 #2328\"")),
         }
@@ -762,7 +825,25 @@ fn analyze(m: &Model, raw: &str, a: &Args, style: &Style) -> Result<(), String> 
     if a.decompose || a.circuit || !a.probe.is_empty() || !a.trace.is_empty() {
         return analyses(m, raw, &ids, focus as usize, a, style);
     }
-    let ans = m.generate(&ids, 32);
+    let requested = a.answer.first().copied().unwrap_or(1);
+    let ans = m.generate(&ids, 32.max(requested));
+    if let Some(path) = &a.result_json {
+        let mut seq = ids[..=focus as usize].to_vec();
+        if a.pos.is_none() {
+            if requested > ans.len() + 1 {
+                return Err(format!("there is no answer token {requested} (the answer ends after {} tokens)", ans.len()));
+            }
+            seq.extend_from_slice(&ans[..requested-1]);
+        }
+        let at = seq.len()-1;
+        let tr = m.run(&seq, at, &RunOpts::default());
+        let output = model::top_probs(&tr.logits, 10);
+        let target = target_token(m,a)?.unwrap_or(output[0].0);
+        let mut result = export::result(m, &seq, at, target, "generate", &output);
+        result["generated"] = serde_json::json!(export::tokens(m, &ans));
+        result["answer"] = serde_json::json!(ans.iter().map(|id| m.tok.piece(*id)).collect::<String>());
+        export::write(path, &result)?;
+    }
     print_answer(m, &ans, style);
     eprintln!("(analyses: --decompose or --probe \"S12 MLP\"; see --help)");
     Ok(())
@@ -776,8 +857,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if a.list {
-        list();
+    if a.serve {
+        if let Err(e) = server::serve() { eprintln!("error: {e}"); std::process::exit(1); }
+        return;
+    }
+    if a.list || a.models_json {
+        list(a.models_json);
         return;
     }
     if let Some(n) = a.threads {

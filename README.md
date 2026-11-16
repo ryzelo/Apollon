@@ -1,5 +1,7 @@
 # apollon
 
+Deutsch: [ANLEITUNG.md](ANLEITUNG.md) erklärt, was apollon ist und wie man die Oberfläche benutzt.
+
 **What does every part of a transformer contribute to one prediction?** apollon answers this for a single
 prompt, exactly and without training anything: no features, no labels, no surrogate model, only the matrix
 products of one forward pass. It is written in Rust without an ML framework and computes the forward pass
@@ -478,3 +480,69 @@ model in memory at the same time, swap grows a lot on an 8 GB machine. Running `
 ## License
 
 MIT, see [LICENSE](LICENSE). Model weights are not part of this repository; their own licenses apply.
+
+## Local web workspace
+
+Build the frontend once, then start the local server from the repository root:
+
+```sh
+cd web
+npm ci
+npm run build
+cd ..
+cargo run --release -- --serve
+```
+
+Open http://127.0.0.1:8765. Select a discovered model or enter a local model path,
+write a prompt and generate an answer. The prompt and the answer appear as tokens
+above the stage; choosing an answer token decomposes its prediction. Choosing a
+component shows the real output next to the output without it, and starts a probe
+of its units, a neuron trace or a contrast-prompt insertion with one click. Each
+follow-up run is listed below the run it was started from. The space view, the flow
+view, the unit view and the table share the selected component and metric, and the
+address holds the open run, view, metric and selection, so a finding can be linked.
+
+The space view is a 3D scene that can be turned and zoomed. For a decomposition it
+places every part by layer, token position and signed effect on the target, with a
+head's read positions as arcs. For a probe it shows every unit and, for the units
+examined in detail, what their removal changes in each later layer. For a trace it
+shows the backward tree across layers and positions, and for a static neuron its
+strongest inputs and outputs in the (p, q) plane. One point is one unit; the units
+of a remainder are drawn dim, and each scene states what it draws and leaves out.
+
+Two sliders on the stage narrow every view to a range of layers and a least size of
+effect. Dragging a rectangle in the flow view, or Shift and Ctrl in the table, marks
+several parts, which then light up in all views. A second run can be compared: its
+values appear beside each part in the panel, as a column in the table and as white
+points in the space view. Pinned parts are found again in every run by layer, type
+and unit. Keys: ← → step through the layers, ↑ ↓ through the ranking, Enter probes
+the selected component, T traces a neuron, P pins, Esc clears.
+
+The server listens only on loopback. One analysis runs at a time; queued and running
+jobs can be cancelled. Runs and reports are stored in `output/web-runs/` and loaded
+on restart. A job interrupted by shutdown is marked interrupted and can be rerun.
+Model weights remain in the Rust worker. The browser receives structured results.
+`DELETE /api/runs/{id}` removes a finished run and its files for good. While a run
+is in progress, its detail carries the engine's last progress line. Set
+`APOLLON_PORT` to serve on another local port.
+
+Structured results (`--result-json`, schema version 2) hold what the HTML reports
+show: for `--decompose` the tokens each change raises and lowers, the output without
+it and every head's attention over the positions; for `--probe` the per-position
+ablations, group ablations, dose curves, contrast patches and what changes in later
+layers; for `--trace` the backward tree, removals, scalar products and pairs; for
+`--neuron` the repertoire and the strongest static inputs and outputs.
+
+On Windows with the MSVC Rust toolchain installed:
+
+```powershell
+cargo +stable-x86_64-pc-windows-msvc run --release --target x86_64-pc-windows-msvc -- --serve
+```
+
+For frontend development, run `npm run dev` in `web` alongside the Rust server.
+The production frontend must be built before serving it with Rust.
+
+The analysis form also supports static neuron reports. A trace can build and reuse
+a neuron atlas under **Advanced options**, which also hold the mode-specific
+parameters. Completed runs list their HTML reports and downloadable files in the
+panel, where the prompt token IDs and the binary forward pass can be exported too.

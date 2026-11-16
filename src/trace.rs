@@ -9,6 +9,7 @@ use crate::fmt::{chip, esc_html, factor, factor_html, num, pad, padl, pct, promp
 use crate::model::{top_probs, Checkpoint, Model, Res, RunOpts, Start, Trace, Variants};
 use crate::neuron::{act_name, adjoint, col_arrows, dot64, forward_runtime, path, phi, pre_norm, read_back, repertoire, runtime_factor, Read, ReadPoint, Repertoire, Scale, Src};
 use crate::readout::{columns, log_odds, softmax, voices};
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -901,6 +902,7 @@ impl<'a> Zoom<'a> {
 // ====================================================================== run
 
 pub struct Opts {
+    pub result_json: Option<PathBuf>,
     /// explicit neurons, or empty for "auto"
     pub neurons: Vec<(usize, usize)>,
     pub depth: usize,
@@ -1098,6 +1100,56 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
             Ok(L01 { src, p, q, top_p, rest_p, top_q, rest_q })
         });
         traced.push(Traced { rt, direct, total, removals, atlas_rank, tree, l01, asked });
+    }
+    if let Some(path) = &o.result_json {
+        use serde_json::json;
+        let mut result = crate::export::result(m, ids, focus, y0, "trace", &top_probs(&tr.logits, 10));
+        let components: Vec<_> = traced.iter().enumerate().map(|(index, t)| {
+            let mut sources: Vec<_> = t.rt.parts.iter().collect();
+            sources.sort_by(|a,b| t.rt.a_of(b).abs().total_cmp(&t.rt.a_of(a).abs()));
+            let remaining = sources.iter().skip(o.top).map(|c| t.rt.a_of(c)).sum::<f64>();
+            let mut children: Vec<_> = sources.iter().take(o.top).enumerate().map(|(j,c)| json!({
+                "id":format!("trace-{index}-source-{j}"),"label":src_txt(m,ids,&c.src),
+                "layer":null,"kind":"source","direct":null,"total":null,"children":[],
+                "activation_contribution":t.rt.a_of(c),"p":c.p,"q":c.q,"source":src_json(&c.src)
+            })).collect();
+            if sources.len() > o.top {
+                children.push(json!({"id":format!("trace-{index}-rest"),"label":"Remaining sources",
+                    "layer":null,"kind":"remainder","direct":null,"total":null,"children":[],
+                    "activation_contribution":remaining,"count":sources.len()-o.top}));
+            }
+            let rt = &t.rt;
+            let src = |c: &Src| { let mut v = src_json(c); v["label"] = json!(src_txt(m, ids, c)); v };
+            let scalars = |x: &L01| json!({"source":src(&x.src),"p":x.p,"q":x.q,
+                "top_p":x.top_p.iter().map(|&(j, v)| json!({"dimension":j,"value":v})).collect::<Vec<_>>(),"rest_p":x.rest_p,
+                "top_q":x.top_q.iter().map(|&(j, v)| json!({"dimension":j,"value":v})).collect::<Vec<_>>(),"rest_q":x.rest_q});
+            let mut atoms: Vec<&Contrib> = rt.atoms.iter().collect();
+            atoms.sort_by(|a, b| rt.a_of(b).abs().total_cmp(&rt.a_of(a).abs()));
+            json!({"id":format!("trace-{index}"),"label":format!("S{} #{}",t.rt.rd.l,t.rt.rd.i),
+                "layer":t.rt.rd.l,"unit":t.rt.rd.i,"kind":"neuron","direct":t.direct,
+                "total":t.total.dlo,"kl":t.total.kl,"children":children,"activation":t.rt.a,
+                "output_without":[{"id":t.total.top.0,"text":m.tok.piece(t.total.top.0),"probability":t.total.top.1}],
+                "p":rt.p,"q":rt.q,"phi":rt.phi,"gated":rt.rd.gated,"silent_neurons":rt.n_silent,
+                "activation_range":[rt.rep.a_min,rt.rep.a_max],
+                "source_count":rt.parts.len(),
+                "groups":groups(rt).iter().map(|g| json!({"group":g.0,"p":g.1,"q":g.2,"activation_contribution":g.3,"count":g.4})).collect::<Vec<_>>(),
+                "read_positions":atoms.iter().take(o.top.max(12)).map(|c| { let mut v = src(&c.src); v["activation_contribution"] = json!(rt.a_of(c)); v }).collect::<Vec<_>>(),
+                "tree":tree_json(m, ids, &t.tree, None),
+                "removals":t.removals.iter().map(|r| json!({"source":src(&r.src),"activation_contribution":r.a_c,
+                    "delta_linear":r.da_lin,"delta_frozen_scale":r.da_frozen,"delta_exact":r.da_real,"activation_without":r.a_new,
+                    "total":r.eff.map(|e| e.dlo),"kl":r.eff.map(|e| e.kl),
+                    "output_without":r.eff.map(|e| json!([{"id":e.top.0,"text":m.tok.piece(e.top.0),"probability":e.top.1}]))})).collect::<Vec<_>>(),
+                "scalars":t.l01.iter().map(|x| scalars(x)).collect::<Vec<_>>(),
+                "scalars_asked":t.asked.as_ref().and_then(|x| x.as_ref().ok()).map(|x| scalars(x)),
+                "pairs":if rt.rd.gated { top_pairs(rt, 12).iter().map(|(a, b, v)| json!({"p_source":src(a),"q_source":src(b),"value":v})).collect::<Vec<_>>() } else { Vec::new() },
+                "atlas_rank":t.atlas_rank.iter().map(|(c, r)| json!({"source":src(c),"rank":r})).collect::<Vec<_>>()})
+        }).collect();
+        result["components"] = json!(components);
+        result["checks"] = json!(traced.iter().flat_map(|t| t.rt.checks.iter().map(|c| json!({
+            "label":c.what,"deviation":c.dev,"tolerance":c.tol,"passed":c.ok()
+        }))).collect::<Vec<_>>());
+        result["report"] = json!(o.html.file_name().map(|x| x.to_string_lossy().to_string()));
+        crate::export::write(path,&result)?;
     }
     for t in &traced {
         terminal(m, ids, focus, y0, t, o, st);
@@ -1547,7 +1599,7 @@ const TRACE_CSS: &str = r#"
 
 // ====================================================================== dump for the reference tests
 
-fn src_json(c: &Src) -> serde_json::Value {
+pub fn src_json(c: &Src) -> serde_json::Value {
     use serde_json::json;
     match *c {
         Src::Token(t) => json!({"kind": "token", "index": t}),
@@ -1563,6 +1615,44 @@ fn src_json(c: &Src) -> serde_json::Value {
         Src::Offset => json!({"kind": "offset"}),
         _ => json!({"kind": "other"}),
     }
+}
+
+/// The backward tree of one neuron: earlier neurons, heads with their read positions and what those
+/// positions carried. Every node holds its contribution a_c to the activation of its parent.
+fn tree_json(m: &Model, ids: &[u32], n: &Node, a_c: Option<f64>) -> serde_json::Value {
+    json!({"kind":"neuron","label":format!("S{} #{}", n.l, n.i),"layer":n.l,"unit":n.i,"position":n.pos,
+        "activation":n.a,"activation_contribution":a_c,"children":children_json(m, ids, n.pos, &n.children)})
+}
+
+fn children_json(m: &Model, ids: &[u32], here: usize, items: &[Child]) -> Vec<serde_json::Value> {
+    items.iter().map(|c| match c {
+        Child::Neuron { a_c, node } => tree_json(m, ids, node, Some(*a_c)),
+        Child::Head { src, a_c, atoms } => {
+            let mut v = src_json(src);
+            v["label"] = json!(src.label(m));
+            v["position"] = json!(here);
+            v["activation_contribution"] = json!(a_c);
+            v["children"] = json!(atoms.iter().map(|av| {
+                let j = av.j as usize;
+                let mut a = json!({"kind":"read","label":pos_txt(m, ids, j),"position":j,"activation_contribution":av.a_c,"children":[]});
+                if let Some(cv) = &av.content {
+                    a["before_layer"] = json!(cv.kv);
+                    a["value_offset"] = json!(cv.offset_a);
+                    a["children"] = json!(children_json(m, ids, j, &cv.items));
+                }
+                a
+            }).collect::<Vec<_>>());
+            v
+        }
+        Child::Other { src, a_c } => {
+            let mut v = src_json(src);
+            v["label"] = json!(src_txt(m, ids, src));
+            v["position"] = json!(if here == usize::MAX { None } else { Some(here) });
+            v["activation_contribution"] = json!(a_c);
+            v["children"] = json!([]);
+            v
+        }
+    }).collect()
 }
 
 fn contrib_json(c: &Contrib) -> serde_json::Value {
