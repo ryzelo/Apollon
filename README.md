@@ -1,6 +1,10 @@
-# apollon
+<p align="center">
+  <img src="assets/eye.png" alt="The apollon logo: an eye drawn from characters" width="760">
+</p>
 
-**Read what LLMs think. Now.**
+<h1 align="center">apollon</h1>
+
+<p align="center"><strong>Read what LLMs think. Now.</strong></p>
 
 apollon opens up a language model while it answers and shows you, for one single prediction, **which parts of
 the model produced it and how much each part contributed**. Exactly, on your own computer, with models you
