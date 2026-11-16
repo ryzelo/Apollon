@@ -158,7 +158,6 @@ pub fn voices(m: &Model, h: &[f32], z: &[f32], p: &[f32], logz: f64, ys: &[u32],
     let lm = m.lm_head();
     let v = lm.rows;
     let vb = ((16usize << 20) / n).clamp(256, 8192) / 64 * 64;
-    let mut wb = vec![0f32; vb * d];
     let mut c = vec![0f32; n * vb];
     let mut acc = vec![Acc::new(); n];
     let mut full = vec![0f32; n_full * v];
@@ -166,8 +165,7 @@ pub fn voices(m: &Model, h: &[f32], z: &[f32], p: &[f32], logz: f64, ys: &[u32],
     let mut v0 = 0;
     while v0 < v {
         let nb = vb.min(v - v0);
-        wb[..nb * d].par_chunks_mut(d).enumerate().for_each(|(i, r)| lm.row(v0 + i, r));
-        blas::gemm_nt(h, &wb[..nb * d], n, nb, d, &mut c[..n * nb]);
+        c[..n * nb].copy_from_slice(&lm.rows_times(v0, nb, h, n));
         if m.logit_cap.is_some() {
             // softcap as a fixed per-token factor softcap(z)/z from this pass (row 0 = whole stream)
             for i in 0..nb {

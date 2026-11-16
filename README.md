@@ -11,6 +11,9 @@ itself, so it can record, split up and rerun everything inside it.
 * **`--probe "S12 MLP"`** is a **test bench for one component**. Every unit inside it (neuron, per-layer-embedding
   dimension, head) is changed by brute force. apollon then follows what changes downstream, all the way to the
   output.
+* **`--circuit`** finds the **circuit down to single scalar products**: every matrix product of the pass is
+  a sum of products W[o,c]·x_c (or q_e·k_e, a_j·v_j[e] inside attention), and apollon switches them off,
+  coarse to fine, until only those the prediction needs are left – each decision an exact rerun.
 * **`--trace "S12 #2328"`**, **`--neuron`** and **`--atlas`** treat **one MLP neuron as a complete computing
   structure**. `--trace` follows one prediction down to single scalar products and back through the positions
   the heads read; `--neuron` reports without a prompt everything the neuron can do; `--atlas` stores that for all
@@ -30,7 +33,10 @@ cargo build --release
 ./target/release/apollon --help
 ```
 
-* **macOS (Apple Silicon)** is the tested platform. Large matrix products run through Apple's Accelerate.
+* **macOS (Apple Silicon)** is the tested platform. Large matrix products run on the GPU through Metal
+  (see [GPU](#gpu-metal-and-cuda)), or through Apple's Accelerate on the CPU.
+* **NVIDIA GPUs (Linux, Windows)**: CUDA is used automatically when a driver is installed. Nothing has to be
+  set at build time – apollon loads the CUDA driver and NVRTC when it starts.
 * **Other platforms** use plain-Rust fallbacks for the same operations. They are compiled and checked (forced
   on macOS), but have not been run on Linux or Windows hardware.
 * `.cargo/config.toml` builds for the local CPU (`target-cpu=native`). Remove that line for a portable binary.
@@ -53,6 +59,7 @@ apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --decompose "Was i
 apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --probe "S16 MLP" --contrast "Was ist 2+3?" "Was ist 2+2?"
 apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --trace "S16 #2328" "Was ist 2+2?"
 apollon -m mlx-community/gemma-3-1b-it-4bit --neuron "S16 #2328"
+apollon -m EleutherAI/pythia-14m --pos -1 --circuit "Monday, Tuesday, Wednesday,"
 ```
 
 `-m` takes an Ollama name (`qwen2.5:3b`), a Hugging Face cache name (`EleutherAI/pythia-70m`), a `.gguf` file or
@@ -245,6 +252,152 @@ Gemma 3 1B (Apple M3, 8 GB RAM):
 * `--trace` of one neuron with reruns and zoom: 1.4 s; zoom depth 3 with 30 read positions decomposed: 12 s
 * `--atlas`: about 11 s per layer; with k = 64 the file is 1.1 GB (Gemma 4 E4B: about 2.7 GB)
 
+## Circuit down to single scalar products (`--circuit`)
+
+```
+apollon -m EleutherAI/pythia-14m --pos -1 --circuit "Monday, Tuesday, Wednesday,"
+apollon -m mlx-community/gemma-3-1b-it-4bit --chat --answer 7 --circuit \
+        --circuit-ref "Was ist 3+5?; Was ist 6+1?; Was ist 4+3?; Was ist 7+2?; Was ist 1+8?" "Was ist 2+2?"
+```
+Every matrix product of the forward pass is a sum of scalar products. One such product at one position is an
+**atom**:
+
+* W[o,c]·x_c in the projections Q, K, V, O, gate, up, down (and the three products of the per-layer embedding
+  in Gemma 4);
+* q_e·k_e in a score of QKᵀ and a_j·v_j[e] in the mixing A·V, per head, query position and key position.
+
+Pythia-14m has 7.1 million atoms on a 6-token prompt, Gemma 3 1B 1.5·10¹⁰ on the 22-token chat prompt.
+Biases, norms, RoPE, softmax and activations are not atoms; they always run on what results.
+`--circuit` keeps only the atoms the prediction needs: **KL(full model ‖ circuit) ≤ ε** (`--circuit-kl`,
+default 0.1 nats) and **the same top token**.
+
+**What "switched off" means** (`--circuit-ablation`):
+
+* **mean** (default, the usual choice in circuit research): a switched-off atom is replaced by its **mean
+  over a reference distribution**. For a projection that is W[o,c]·x̄_c, with x̄ the mean input of that matrix
+  product over all reference positions; a unit switched off completely gives W·x̄. For a score or a mixing
+  it is the mean of q_e·k_e or a_j·v_j[e] over all (query, key) pairs the reference queries see. The
+  reference is the analyzed sequence itself, or the prompts given with `--circuit-ref "A; B; …"` (wrapped
+  like the prompt with `--chat` and completed with their own greedy answer). A leading `<bos>` is left out
+  of the means: it is an attention sink with untypical activations.
+* **zero**: a switched-off atom is missing from its sum. This takes the model further off its usual
+  distribution: whatever is removed leaves a hole that later layers never see in normal use.
+
+**The search goes coarse to fine.**
+
+1. Components at every position: attention (the query side: Q, scores, mixing, O), the K/V projections, MLP,
+   PLE.
+2. Heads, K/V groups, neurons, PLE dimensions.
+3. Inside heads and K/V groups: the q dimensions, every key of QKᵀ and of A·V, every input column of W_O, the
+   k and v dimensions; the rows of the PLE input projection. (One unit of a neuron off is the whole neuron off,
+   so neurons go straight to level 4.)
+4. Single atoms.
+5. Final phase: whatever stayed as a block is split down to single elements, then every leaf is switched off
+   alone against the final circuit, until nothing more can go.
+
+Within a level:
+
+* **Dose curves and a joint choice.** For every group – the neurons of one MLP at one position, the atoms of
+  one neuron's read, … – its weakest pieces up to a share τ of the group's magnitude are switched off, each
+  group alone, all in one batch. Then, for about 30 trade-offs between atoms removed and KL, every group takes
+  its best τ, and all of these joint choices run exactly. The one that removes the most atoms and passes is
+  kept.
+* **Halving** (adaptive group testing): what is left is tested in halves, the halves that fail are halved
+  again, down to single pieces.
+* **Greedy acceptance**: pieces that may go alone are accepted cheapest first, as long a prefix of the list as
+  still fits, many prefixes per pass.
+* **Recheck**: at the end of every level each kept piece is tested alone once more against the new state.
+* Levels 1–4 may use 25, 45, 60 and 85% of ε cumulatively, the final phase all of it, so that the coarse
+  levels do not use up what the fine ones need.
+
+**What makes it exact:**
+
+* Every decision is a rerun of the real model from the earliest layer it touches. Magnitudes (|W·x|,
+  activations, attention weights) only decide the order of the tests: no gradients, no linearization, no
+  surrogate or replacement model, no trained dictionary.
+* Many candidates run in one pass, each as a copy of the positions from its change to the focus (as in
+  `--probe`). Every accepted step is then rerun on its own and has to pass again; the largest
+  |KL batch − KL standalone| is reported.
+* What provably has no effect any more is switched off without a test: a head whose W_O columns are all off,
+  a neuron whose down is off, K/V rows that no score or mixing reads, a PLE dimension whose projection is
+  off – and with zero ablation also what only gets an exact 0 as input (a head whose A·V products are all
+  off, a neuron whose gate or up is off). The output then has to stay **bit-identical**, and that is
+  checked.
+* At the end every leaf is individually necessary: switching off any single remaining atom alone breaks the
+  criterion.
+* An empty cut gives the normal pass bit for bit.
+* `tests/compare_circuit.py` applies the same cut to transformers in float64 – every projection recomputed
+  from its weights with the keep mask, an attention function that drops (or replaces by their means) the
+  switched-off q_e·k_e and a_j·v_j[e] – for random cuts over every kind of atom, for the circuit and for its
+  complement, with zero and mean ablation, frozen and live norms. For mean ablation it computes the means
+  itself from transformers and compares them with apollon's.
+
+**Norms: frozen by default.** With frozen norms (`--circuit-norms frozen`) every norm – pre-, post-, q/k/v,
+PLE and final norm – keeps the scale it has in the full model at that position, so a part that stays acts
+with its real size. With live norms (`--circuit-norms live`) every norm recomputes its scale from what is
+left, and a post-norm (Gemma) blows up any small rest to full size. On Gemma 3 1B, "Was ist 2+2?", the live
+search ends with 20 atoms of one neuron (S24 #5561, values around 0.0006): alone they give "4" at 92%, but
+everything *except* them still gives "4" at 100% – the norm makes them sufficient, the model does not use them.
+Both modes are exact reruns of a well-defined computation; the report states which one was used, and an empty
+cut with frozen norms has to give the normal pass bit for bit.
+
+**Output.** Atoms on per layer, with the heads and neurons still alive; all leaves, sorted by how much the
+prediction breaks without each one alone, with the value of every single atom; the circuit alone and
+**everything except the circuit** (exactly the circuit's atoms off, all others on). The HTML report
+(`<name>_circuit.html`) adds the levels and a layer × position map. `--circuit-depth N` stops at level N
+(1 = components … 4 = atoms), `--circuit-tests N` stops refining after N tests (what is unresolved then stays
+whole, and the report says so), `--dump-circuit FILE` writes the cut cell by cell and the logits as JSON.
+
+**Example** (Pythia-14m, "Monday, Tuesday, Wednesday," → " Wednesday", 24%): of 7,110,144 atoms, 1,989 stay
+on with frozen norms. With only them the model still says " Wednesday" (24%, KL 0.0998); with everything
+except them it says " and" (KL 8.8). About 1.02 million exact tests in 8,750 passes, 6.5 minutes on an Apple M3 –
+most of it in the final phase, which resolves 200,000 atoms in blocks down to single ones. With live norms
+the circuit has 803 atoms; its most necessary single product is a score in layer 3, head 3 – query "," [5] ·
+key " Wednesday" [4], dimension 25.
+
+**Limits.**
+
+* One prompt, one prediction.
+* The circuit is *one* minimal set (no single leaf can go), found greedily – not necessarily the smallest. A
+  different order of tests can find a different one.
+* Mean ablation depends on the reference: the circuit explains the prediction *relative to* it. With
+  similar prompts (other numbers, same format) the circuit is what carries the difference – the number –
+  rather than what produces the format.
+* A key whose score products are all off gets the score 0, not −∞: taking a key out of the softmax is not a
+  matrix product, so it is not an atom.
+* The runtime grows with the size of the circuit (roughly 2 tests per atom in the final phase) and with the
+  number of sequential steps: every accepted step is a standalone rerun. Gemma 3 1B with frozen norms keeps
+  150 of 1,716 components at level 1 (5 min) and needs more than an hour for the finer levels on an 8 GB M3.
+  `--circuit-depth` and `--circuit-tests` bound it.
+
+## GPU: Metal and CUDA
+
+```
+apollon -m … --gpu auto|metal|cuda|off …     (default auto; also $APOLLON_GPU)
+apollon -m mlx-community/gemma-3-1b-it-4bit --selftest-gpu
+```
+The matrix products – every projection and the output matrix – run on the GPU; everything else (norms,
+attention, the cuts of `--circuit`, the analyses) stays on the CPU.
+
+* **The weights stay quantized as in the file.** A kernel unpacks a block of rows exactly as the CPU does –
+  all 16 GGML formats (F32, F16, BF16, Q4_0 … Q8_0, Q2_K … Q6_K, IQ4_NL, IQ4_XS, MXFP4) and MLX affine 2–8 bit
+  – and a second kernel multiplies. One kernel source serves both backends (`src/gpu/kernels.h`).
+* **Metal (macOS):** the mapped model file is handed to the GPU without a copy (unified memory, one buffer per
+  tensor); the product runs on Apple's tuned GEMM (Metal Performance Shaders), with apollon's own kernel as
+  a fallback (`APOLLON_METAL_OWN_GEMM=1`).
+* **CUDA (NVIDIA):** the driver API and NVRTC are loaded at runtime (`libcuda.so.1` / `nvcuda.dll`,
+  `libnvrtc.so.*` / `nvrtc64_*.dll`); the kernels are compiled for the GPU found. Every weight tensor is copied
+  to the GPU once, the first time it is used. Without a driver apollon simply runs on the CPU.
+* **`--selftest-gpu`** checks the GPU against the CPU: every format with random blocks and every matrix of the
+  first two layers and the output matrix of the given model – unpacked values bit for bit, products to float
+  rounding – and times a product with 512 rows on both.
+
+Apple M3, 8 GB (Gemma 3 1B, MLX 4-bit): all 16 formats and 7 MLX variants unpack bit-identically to the CPU;
+products agree to ≤ 2.5·10⁻⁷ relative, the whole pass (residual after every layer) to 4·10⁻⁷, the logits to
+6·10⁻⁶. A product of 512 rows with the 6,912 × 1,152 gate matrix takes 6.3 ms on the GPU against 15.6 ms on the
+CPU. The CUDA path is compiled from the same kernel source and checked to translate to PTX (clang), but it has
+not run on NVIDIA hardware yet: `apollon --gpu cuda --selftest-gpu -m …` is the first thing to run there.
+
 ## Supported – the construction kit
 
 A weight file contains no computation recipe. apollon therefore assembles every layer from components that it
@@ -287,6 +440,8 @@ Not described yet (clear error message): mixture-of-experts, Gemma 2, Phi, GPT-2
 | `tests/compare_tokenizer.py`: Gemma 4 (GGUF + MLX), Gemma 3, GPT-Neo, RoBERTa against the originals | 10/10 texts per model |
 | `tests/compare_ollama.py`: the sorted top-5 probabilities against Ollama's logprobs (needs a running Ollama server) | qwen2.5:3b: ≤ 0.1 percentage points on five prompts, 2.8 on the chat prompt (Ollama computes with its own implementation and rounded activations) |
 | `tests/compare_neuron.py`: `--trace … --dump-neuron` against transformers hooks + NumPy for random Llama, Qwen3, Gemma 3 and the real Pythia-14m: p, q, a, s, x̂, every scalar product, the contribution of the embedding, every head and every earlier neuron, biases, Gram matrix, extremes (400k-angle grid, 20k random inputs); for the strongest atom from layer 1 on, the chain to its read position, the value offset, and every source at that position | max. rel. dev. 10⁻⁹ … 1.4·10⁻⁶ |
+| `tests/compare_circuit.py`: `--circuit --dump-circuit` against transformers in float64 – random Llama, Qwen3, Gemma 3 and the real Pythia-14m; four random cuts over every kind of atom (`--circuit-random`; zero and mean ablation, frozen and live norms, with and without `--circuit-ref`), the circuits of the search and their complements; the means against means computed from transformers | random models ≤ 6·10⁻⁷; Pythia-14m ≤ 8·10⁻⁵ (float32 rounding; passes if within max(10⁻⁴, 2 × the deviation of the same reference in float32)) |
+| `--selftest-gpu` (Metal, Apple M3): every weight format with random blocks, every matrix of Gemma 3 1B (MLX 4-bit), Qwen2.5 3B (GGUF Q4_K/Q6_K), Gemma 4 E4B (GGUF), Pythia-14m/70m (F16) against the CPU | unpacked values bit-identical; products ≤ 2.5·10⁻⁷ |
 | `cargo test`: ellipse extremes against random inputs on the sphere (2–32 dimensions, all activations, degenerate cases) | no sample above a_max or below a_min, extremes reached |
 
 On Pythia-14m, float32 rounding matters: the model has very large activations. On the sentence "Numbers 12345 and
@@ -301,13 +456,14 @@ cargo test --release                                   # unit tests (no models n
 pip install --target /tmp/ref transformers gguf tokenizers safetensors torch numpy
 PYTHONPATH=/tmp/ref python3 tests/compare_hf.py target/release/apollon /tmp/work
 PYTHONPATH=/tmp/ref python3 tests/compare_neuron.py target/release/apollon /tmp/work
+PYTHONPATH=/tmp/ref python3 tests/compare_circuit.py target/release/apollon /tmp/work
 ```
 
 * Every script states in its docstring which models it needs. The small random models are generated on the
   fly; the real ones (Pythia, TinyStories, unixcoder, the Gemma tokenizers) must be in the Hugging Face cache.
 * Cases whose model is missing are skipped.
 * `compare_mlx.py` needs the `mlx` package (Apple Silicon).
-* `--dump FILE` and `--tokens-only` exist for these tests.
+* `--dump FILE`, `--tokens-only`, `--dump-neuron`, `--dump-circuit` and `--circuit-random` exist for these tests.
 
 **Memory:** apollon itself needs little RAM, because the weights stay in the file. If Ollama holds the same large
 model in memory at the same time, swap grows a lot on an 8 GB machine. Running `ollama stop <model>` first helps.

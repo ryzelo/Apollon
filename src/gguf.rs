@@ -60,6 +60,7 @@ pub fn map_file(path: &Path) -> Result<&'static [u8], String> {
     let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let m = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| format!("{}: {e}", path.display()))?;
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    crate::gpu::register_region(&m[..]);
     Ok(&m[..])
 }
 

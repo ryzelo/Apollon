@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-const NY: usize = 2; // target token, rival
+pub(crate) const NY: usize = 2; // target token, rival
 const DOSE: [f32; 6] = [-2.0, -1.0, 0.0, 0.5, 2.0, 4.0];
 const ALL: usize = usize::MAX; // unit at all positions at once
 /// rows per variant pass
@@ -88,10 +88,10 @@ impl Variant {
 
 /// Output of one variant
 #[derive(Clone, Copy, Default)]
-struct Out {
-    lo: [f32; NY], // log-odds
-    top: [(u32, f32); 3],
-    kl: f32, // KL(real ‖ variant)
+pub(crate) struct Out {
+    pub lo: [f32; NY], // log-odds
+    pub top: [(u32, f32); 3],
+    pub kl: f32, // KL(real ‖ variant)
 }
 
 /// Result of one variant: its output and that of the unchanged copy in the same pass
@@ -133,7 +133,12 @@ struct Acc {
 }
 
 /// For every row of xs (stream at the end): log-odds of the targets, top 3, KL to the real output p_ref.
-fn read_out(m: &Model, xs: &[f32], ys: &[u32; NY], p_ref: &[f32], ref_plp: f64) -> Vec<Out> {
+pub(crate) fn read_out(m: &Model, xs: &[f32], ys: &[u32; NY], p_ref: &[f32], ref_plp: f64) -> Vec<Out> {
+    read_out_fz(m, xs, ys, p_ref, ref_plp, None)
+}
+
+/// read_out with the scale of the final norm given for every row (frozen norms)
+pub(crate) fn read_out_fz(m: &Model, xs: &[f32], ys: &[u32; NY], p_ref: &[f32], ref_plp: f64, fin: Option<f32>) -> Vec<Out> {
     let d = m.d;
     let n = xs.len() / d;
     if n == 0 {
@@ -143,7 +148,7 @@ fn read_out(m: &Model, xs: &[f32], ys: &[u32; NY], p_ref: &[f32], ref_plp: f64) 
         Some(nm) => {
             let mut h = vec![0f32; xs.len()];
             h.par_chunks_mut(d).zip(xs.par_chunks(d)).for_each(|(o, x)| {
-                nm.apply(x, o);
+                nm.apply_fz(x, o, fin);
             });
             h
         }
@@ -152,7 +157,6 @@ fn read_out(m: &Model, xs: &[f32], ys: &[u32; NY], p_ref: &[f32], ref_plp: f64) 
     let lm = m.lm_head();
     let v = lm.rows;
     let vb = ((16usize << 20) / n).clamp(256, 8192) / 64 * 64;
-    let mut wb = vec![0f32; vb * d];
     let mut c = vec![0f32; n * vb];
     let mut st = vec![Acc { m: f32::NEG_INFINITY, a: 0.0, ax: [0.0; NY], ly: [0.0; NY], top: [(f32::NEG_INFINITY, 0); 3], pl: 0.0 }; n];
     let cap = m.logit_cap;
@@ -160,8 +164,7 @@ fn read_out(m: &Model, xs: &[f32], ys: &[u32; NY], p_ref: &[f32], ref_plp: f64) 
     let mut v0 = 0;
     while v0 < v {
         let nb = vb.min(v - v0);
-        wb[..nb * d].par_chunks_mut(d).enumerate().for_each(|(i, r)| lm.row(v0 + i, r));
-        blas::gemm_nt(&h, &wb[..nb * d], n, nb, d, &mut c[..n * nb]);
+        c[..n * nb].copy_from_slice(&lm.rows_times(v0, nb, &h, n));
         let pb = &p_ref[v0..v0 + nb];
         c[..n * nb].par_chunks_mut(nb).zip(st.par_iter_mut()).for_each_init(
             || (vec![0f32; vb], vec![0f32; vb]),

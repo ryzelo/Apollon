@@ -3,11 +3,14 @@
 //! Two analyses of a single prompt, both exact for this one forward pass:
 //! --decompose  every change of the residual stream as a token voice, with its total effect by rerun
 //! --probe      brute-force test bench for one component (neurons, PLE dimensions or heads)
+//! --circuit    exact circuit search down to single scalar products
 mod atlas;
 mod blas;
+mod circuit;
 mod decompose;
 mod fmt;
 mod gguf;
+mod gpu;
 mod inspect;
 mod model;
 mod neuron;
@@ -30,6 +33,7 @@ Usage:
   apollon -m MODEL [options] --decompose PROMPT
   apollon -m MODEL [options] --probe \"S12 MLP\" PROMPT
   apollon -m MODEL [options] --trace \"S12 #2328\" PROMPT   (or --trace auto)
+  apollon -m MODEL [options] --circuit PROMPT          circuit down to single scalar products
   apollon -m MODEL --neuron \"S12 #2328\"  static report of one neuron, no prompt needed
   apollon -m MODEL --atlas FILE          build the static atlas of all neurons, no prompt needed
   apollon -m MODEL PROMPT                only generate the answer (greedy)
@@ -71,6 +75,27 @@ Analyses:
   --scalars N      with --trace: scalar products shown (default 10)
   --scalars-of SRC with --trace: level 0×1 for this source, e.g. \"S14 head 1\", \"S14 head 1 @16\", \"S14 #868\", token
   --dump-neuron F  with --trace: write the first neuron's decomposition as JSON (for tests/compare_neuron.py)
+  --circuit        circuit search down to single scalar products: every matrix product is a sum of atoms
+                   W[o,c]·x_c (Q, K, V, O, gate, up, down, PLE) or q_e·k_e and a_j·v_j[e] (QKᵀ, A·V), one per
+                   position. Atoms are switched off – missing from their sum – coarse to fine (components per
+                   position → heads/neurons → dimensions/keys → single atoms) until only what the prediction
+                   needs is left: KL(full ‖ circuit) ≤ ε and the same top token. Every decision is an exact
+                   rerun; at the end every leaf is individually necessary. Terminal report, HTML.
+  --circuit-kl E   with --circuit: tolerance ε in nats (default 0.1)
+  --circuit-depth N  with --circuit: finest level, 1 = components, 2 = heads/neurons, 3 = dimensions/keys,
+                   4 = single atoms (default 4)
+  --circuit-tests N  with --circuit: stop refining after N tests; unresolved blocks stay whole (default 2000000)
+  --circuit-ablation A  with --circuit: mean (default) = a switched-off atom is replaced by its mean over
+                   the reference positions (W[o,c]·x̄_c; for scores and mixing the mean of q_e·k_e and
+                   a_j·v_j[e] over all query/key pairs); zero = it is missing from its sum
+  --circuit-ref T  with --circuit and mean ablation: reference prompts for the means, several with ;
+                   (wrapped like the prompt with --chat, plus their own greedy answer). Default: the
+                   analyzed sequence itself
+  --circuit-norms M  with --circuit: frozen (default) = every norm keeps the scale it has in the full model at
+                   that position, so switching parts off cannot inflate what is left; live = norms recompute
+                   their scale (a post-norm then blows up any small rest to full size)
+  --circuit-show N with --circuit: leaves listed in the terminal (default 25)
+  --dump-circuit F with --circuit: write the circuit and the logits as JSON (for tests/compare_circuit.py)
   --neuron NEURON  static report without a prompt: the repertoire (all activations the neuron can reach:
                    (p, q) lies in a filled ellipse), all inputs by source kind and all outputs (later neurons,
                    token voice, later heads)
@@ -86,6 +111,9 @@ Options:
   --pos N          analyze the prediction at prompt token N instead (negative counts from the end)
   --target TOKEN   target token (default: the predicted token), e.g. --target \" Paris\"
   --html NAME      base name of the HTML reports (default apollon)
+  --gpu MODE       matrix products on the GPU: auto (default: Metal on macOS, CUDA if an NVIDIA driver
+                   is found, else CPU), metal, cuda, off. Also via $APOLLON_GPU. CUDA needs no build
+                   option: the driver and NVRTC are loaded at runtime
   --color / --no-color
   --threads N
 
@@ -130,6 +158,18 @@ struct Args {
     atlas: Option<String>,
     atlas_k: Option<usize>,
     atlas_layers: Option<(usize, usize)>,
+    circuit: bool,
+    circuit_kl: Option<f32>,
+    circuit_depth: Option<usize>,
+    circuit_tests: Option<usize>,
+    circuit_show: Option<usize>,
+    dump_circuit: Option<String>,
+    circuit_random: Option<u64>,
+    circuit_norms: Option<String>,
+    circuit_ablation: Option<String>,
+    circuit_ref: Vec<String>,
+    gpu: Option<String>,
+    selftest_gpu: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -151,6 +191,9 @@ fn parse_args() -> Result<Args, String> {
             "--color" => a.color = Some(true),
             "--no-color" => a.color = Some(false),
             "--threads" => a.threads = Some(number(val(&x)?, "--threads")?),
+            "--gpu" => a.gpu = Some(val(&x)?),
+            // internal: GPU against CPU for every weight format and every matrix of the model
+            "--selftest-gpu" => a.selftest_gpu = true,
             "--list" => a.list = true,
             "--dump" => a.dump = Some(val(&x)?),
             "--tokens-only" => a.tokens_only = true,
@@ -176,6 +219,29 @@ fn parse_args() -> Result<Args, String> {
                 let (lo, hi) = v.split_once("..").ok_or("--atlas-layers expects a range like 0..8")?;
                 a.atlas_layers = Some((number(lo.to_string(), "--atlas-layers")?, number(hi.to_string(), "--atlas-layers")?));
             }
+            "--circuit" => a.circuit = true,
+            "--circuit-kl" => a.circuit_kl = Some(val(&x)?.parse().map_err(|_| "--circuit-kl expects a number")?),
+            "--circuit-depth" => a.circuit_depth = Some(number(val(&x)?, "--circuit-depth")?),
+            "--circuit-tests" => a.circuit_tests = Some(number(val(&x)?, "--circuit-tests")?),
+            "--circuit-show" => a.circuit_show = Some(number(val(&x)?, "--circuit-show")?),
+            "--dump-circuit" => a.dump_circuit = Some(val(&x)?),
+            "--circuit-ablation" => {
+                let v = val(&x)?;
+                if v != "zero" && v != "mean" {
+                    return Err("--circuit-ablation expects zero or mean".into());
+                }
+                a.circuit_ablation = Some(v);
+            }
+            "--circuit-ref" => a.circuit_ref.extend(val(&x)?.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())),
+            "--circuit-norms" => {
+                let v = val(&x)?;
+                if v != "frozen" && v != "live" {
+                    return Err("--circuit-norms expects frozen or live".into());
+                }
+                a.circuit_norms = Some(v);
+            }
+            // internal, for tests/compare_circuit.py: a random cut instead of the search
+            "--circuit-random" => a.circuit_random = Some(val(&x)?.parse().map_err(|_| "--circuit-random expects a number")?),
             "--html" => a.html = Some(val(&x)?.trim_end_matches(".html").to_string()),
             "--answer" => {
                 a.answer = val(&x)?.split(',').map(|s| s.trim().parse::<usize>()).collect::<Result<_, _>>().map_err(|_| "--answer expects numbers, e.g. 1,6")?;
@@ -502,6 +568,22 @@ fn target_token(m: &Model, a: &Args) -> Result<Option<u32>, String> {
 /// Run the requested analyses at the focus (with --pos) or at the chosen answer tokens.
 fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &Style) -> Result<(), String> {
     let target = target_token(m, a)?;
+    // reference sequences for --circuit's mean ablation: wrapped like the prompt, plus their own greedy
+    // answer (as the analyzed sequence has its answer so far)
+    let mut circuit_refs: Vec<Vec<u32>> = Vec::new();
+    if a.circuit && a.circuit_ablation.as_deref() != Some("zero") {
+        for r in &a.circuit_ref {
+            let mut seq = m.tok.encode(&if a.chat { chat_wrap(m, r)? } else { r.clone() });
+            if a.pos.is_none() {
+                let ans = m.generate(&seq, 12);
+                seq.extend(ans);
+            }
+            if seq.is_empty() {
+                return Err(format!("--circuit-ref {r:?} gives no tokens"));
+            }
+            circuit_refs.push(seq);
+        }
+    }
     let base = a.html.clone().unwrap_or_else(|| "apollon".into());
     let one = |seq: &[u32], f: usize, suffix: String, contrast: Option<Vec<u32>>| -> Result<(), String> {
         for part in &a.probe {
@@ -536,6 +618,21 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
                 scalars_of: a.scalars_of.clone(),
             };
             trace::run(m, seq, f, target, &o, style)?;
+        }
+        if a.circuit {
+            let o = circuit::Opts {
+                kl: a.circuit_kl.unwrap_or(0.1),
+                depth: a.circuit_depth.unwrap_or(4),
+                max_tests: a.circuit_tests.unwrap_or(2_000_000),
+                show: a.circuit_show.unwrap_or(25),
+                html: PathBuf::from(format!("{base}_circuit{suffix}.html")),
+                dump: a.dump_circuit.as_ref().map(PathBuf::from),
+                random: a.circuit_random,
+                frozen: a.circuit_norms.as_deref() != Some("live"),
+                mean: a.circuit_ablation.as_deref() != Some("zero"),
+                refs: circuit_refs.clone(),
+            };
+            circuit::run(m, seq, f, target, &o, style)?;
         }
         if a.decompose {
             let o = decompose::Opts { focus_only: a.focus_only, html: PathBuf::from(format!("{base}_decompose{suffix}.html")), k: a.top.unwrap_or(8) };
@@ -662,7 +759,7 @@ fn analyze(m: &Model, raw: &str, a: &Args, style: &Style) -> Result<(), String> 
     if focus < 0 || focus >= t {
         return Err(format!("--pos {} lies outside 0..{}", a.pos.unwrap_or(0), t - 1));
     }
-    if a.decompose || !a.probe.is_empty() || !a.trace.is_empty() {
+    if a.decompose || a.circuit || !a.probe.is_empty() || !a.trace.is_empty() {
         return analyses(m, raw, &ids, focus as usize, a, style);
     }
     let ans = m.generate(&ids, 32);
@@ -690,11 +787,19 @@ fn main() {
         eprintln!("{HELP}\n\nerror: no model given (-m). Available models: apollon --list");
         std::process::exit(2);
     };
-    let static_only = !a.neuron.is_empty() || (a.atlas.is_some() && a.trace.is_empty());
+    let static_only = !a.neuron.is_empty() || (a.atlas.is_some() && a.trace.is_empty()) || a.selftest_gpu;
     if a.prompt.is_empty() && !static_only {
         eprintln!("error: no prompt given (help: --help)");
         std::process::exit(2);
     }
+    let gpu_choice = a.gpu.clone().or_else(|| std::env::var("APOLLON_GPU").ok()).unwrap_or_else(|| "auto".into());
+    let backend = match gpu::init(&gpu_choice) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
     let color = a.color.unwrap_or_else(|| std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none());
     let style = Style { color, width: term_width() };
     let t0 = Instant::now();
@@ -706,7 +811,32 @@ fn main() {
         }
     };
     if !a.tokens_only {
-        eprintln!("{} · loaded in {} s", describe(&m), num(t0.elapsed().as_secs_f32(), 2));
+        eprintln!("{} · loaded in {} s · matrix products: {backend}", describe(&m), num(t0.elapsed().as_secs_f32(), 2));
+    }
+    if a.selftest_gpu {
+        let mut mats: Vec<(String, &tensor::Mat)> = vec![("output".into(), m.lm_head())];
+        for (l, b) in m.blocks.iter().enumerate().take(2) {
+            let at = &b.attn;
+            for (n, w) in [("q", &at.wq), ("k", &at.wk), ("v", &at.wv), ("qkv", &at.wqkv)] {
+                if let Some(w) = w {
+                    mats.push((format!("S{l} {n}"), w));
+                }
+            }
+            mats.push((format!("S{l} o"), &at.wo));
+            if let Some(g) = &b.mlp.gate {
+                mats.push((format!("S{l} gate"), g));
+            }
+            mats.push((format!("S{l} up"), &b.mlp.up));
+            mats.push((format!("S{l} down"), &b.mlp.down));
+            if let Some(p) = &b.ple {
+                mats.push((format!("S{l} PLE gate"), &p.gate));
+                mats.push((format!("S{l} PLE proj"), &p.proj));
+            }
+        }
+        let (rep, ok) = gpu::selftest(&mats);
+        print!("{rep}");
+        println!("{}", if ok { "GPU self-test: all OK" } else { "GPU self-test: FAILED" });
+        std::process::exit(if ok { 0 } else { 1 });
     }
     if let Err(e) = statics(&m, &a, &style) {
         eprintln!("error: {e}");

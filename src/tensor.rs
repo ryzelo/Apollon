@@ -17,6 +17,12 @@ pub struct Mat {
     store: Store,
 }
 
+/// The storage of a matrix as the GPU kernels need it
+pub enum View {
+    Plain { dt: DType, data: &'static [u8], row_bytes: usize },
+    Mlx { packed: &'static [u8], wpr: usize, scales: (DType, &'static [u8]), biases: Option<(DType, &'static [u8])>, ng: usize, bits: usize, gs: usize },
+}
+
 #[inline]
 fn scalar(dt: DType, d: &[u8], i: usize) -> f32 {
     match dt {
@@ -81,6 +87,26 @@ impl Mat {
         Ok(Mat { rows, cols, store: Store::Mlx { packed, wpr, scales, biases, ng, bits, gs } })
     }
 
+    pub fn view(&self) -> View {
+        match &self.store {
+            Store::Plain { dt, data, row_bytes } => View::Plain { dt: *dt, data, row_bytes: *row_bytes },
+            Store::Mlx { packed, wpr, scales, biases, ng, bits, gs } => View::Mlx { packed, wpr: *wpr, scales: *scales, biases: *biases, ng: *ng, bits: *bits, gs: *gs },
+        }
+    }
+
+    /// x [t][cols] times rows r0..r0+nb: [t][nb] (on the GPU if one is active)
+    pub fn rows_times(&self, r0: usize, nb: usize, x: &[f32], t: usize) -> Vec<f32> {
+        if let Some(y) = crate::gpu::backend().and_then(|g| g.matmul(self, x, t, 1, r0, nb)) {
+            return y;
+        }
+        let cols = self.cols;
+        let mut wb = vec![0f32; nb * cols];
+        wb.par_chunks_mut(cols).enumerate().for_each(|(i, r)| self.row(r0 + i, r));
+        let mut c = vec![0f32; t * nb];
+        crate::blas::gemm_nt(x, &wb, t, nb, cols, &mut c);
+        c
+    }
+
     pub fn type_name(&self) -> String {
         match &self.store {
             Store::Plain { dt, .. } => dt.name().to_string(),
@@ -92,6 +118,22 @@ impl Mat {
     pub fn row(&self, r: usize, out: &mut [f32]) {
         match &self.store {
             Store::Plain { dt, data, row_bytes } => dequant(*dt, &data[r * row_bytes..(r + 1) * row_bytes], &mut out[..self.cols]),
+            // fast path: 4 bits, groups of whole words – 8 values per u32, same arithmetic as below
+            Store::Mlx { packed, wpr, scales, biases, ng, bits: 4, gs } if gs % 8 == 0 => {
+                let w = &packed[r * wpr * 4..(r + 1) * wpr * 4];
+                for g in 0..*ng {
+                    let s = scalar(scales.0, scales.1, r * ng + g);
+                    let b = biases.map_or(0.0, |(dt, d)| scalar(dt, d, r * ng + g));
+                    let c0 = g * gs;
+                    for (k, o) in out[c0..c0 + gs].chunks_exact_mut(8).enumerate() {
+                        let i = (c0 / 8 + k) * 4;
+                        let v = u32::from_le_bytes([w[i], w[i + 1], w[i + 2], w[i + 3]]);
+                        for (j, x) in o.iter_mut().enumerate() {
+                            *x = s * ((v >> (4 * j)) & 0xF) as f32 + b;
+                        }
+                    }
+                }
+            }
             Store::Mlx { packed, wpr, scales, biases, ng, bits, gs } => {
                 let w = &packed[r * wpr * 4..(r + 1) * wpr * 4];
                 let word = |k: usize| u32::from_le_bytes([w[4 * k], w[4 * k + 1], w[4 * k + 2], w[4 * k + 3]]) as u64;
@@ -132,6 +174,15 @@ impl Mat {
         let (rows, cols) = (self.rows, self.cols);
         assert_eq!(x.len(), t * cols);
         assert_eq!(cols % parts, 0);
+        if let Some(y) = crate::gpu::backend().and_then(|g| g.matmul(self, x, t, parts, 0, rows)) {
+            return y;
+        }
+        self.matmul_split_cpu(x, t, parts)
+    }
+
+    /// matmul_split on the CPU only
+    pub fn matmul_split_cpu(&self, x: &[f32], t: usize, parts: usize) -> Vec<f32> {
+        let (rows, cols) = (self.rows, self.cols);
         #[cfg(target_os = "macos")]
         if t >= 64 {
             return self.matmul_gemm(x, t, parts);

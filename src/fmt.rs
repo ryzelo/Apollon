@@ -68,7 +68,7 @@ pub fn thousands(n: usize) -> String {
     out
 }
 
-fn superscript(e: i32) -> String {
+pub fn superscript(e: i32) -> String {
     e.to_string()
         .chars()
         .map(|c| match c {
