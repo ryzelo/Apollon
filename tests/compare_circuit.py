@@ -143,16 +143,34 @@ def linear_sites(ly, neox):
 
 
 def hf_means(hf, kind, J):
-    """Mean ablation, computed here from transformers alone: over the reference sequences and positions in
-    J, the mean input of every projection, and the mean of q_e·k_e and a_j·v_j[e] over all visible
-    (query, key) pairs of these positions."""
+    """Mean ablation, computed here from transformers alone, with the rules apollon states: per position of
+    the analyzed sequence the mean over the references at that position (position-wise, with
+    --circuit-ref; and position 0 if it is <bos>), else the mean over all positions of the references
+    except a leading special token. Means of the input of every projection and of the factors of QKᵀ and
+    A·V (q, k, v as the attention gets them, the attention weights per query/key position; their fallback
+    is the mean weight on <bos> or on any other key)."""
     neox = kind == "neox"
     layers = hf.gpt_neox.layers if neox else hf.model.layers
-    sums, n = {}, 0
-    pairs = {}
+    T = len(J["tokens"])
+    pw, bos = J["positionwise"], J["bos"]
+    acc = {}  # (layer, slot, name) -> [sum, count]; slot = position or "g"
+    att = {}  # (layer, slot) -> (sum [H][T or 2], count)
     mod = eager_module(kind)
     orig = mod.eager_attention_forward
     cur = {}
+
+    def put(l, slot, name, x):
+        a = acc.setdefault((l, slot, name), [0.0, 0])
+        a[0] = a[0] + x
+        a[1] += 1
+
+    def slots(p):
+        out = []
+        if p < T and (pw or (p == 0 and bos and cur["start"] == 1)):
+            out.append(p)
+        if p >= cur["start"]:
+            out.append("g")
+        return out
 
     def rec_eager(module, query, key, value, attention_mask, scaling=None, dropout=0.0, softcap=None, **kw):
         l = module.layer_idx
@@ -161,58 +179,96 @@ def hf_means(hf, kind, J):
         q = query[0].detach().double().numpy()
         k = key[0].detach().double().numpy()
         v = value[0].detach().double().numpy()
-        T = q.shape[1]
-        rep = q.shape[0] // k.shape[0]
-        k, v = np.repeat(k, rep, axis=0), np.repeat(v, rep, axis=0)
-        mask = attention_mask[0, 0].detach().double().numpy()[:, :T] if attention_mask is not None else np.triu(np.full((T, T), -np.inf), 1)
-        s = np.einsum("hie,hje->hij", q, k) * scaling
+        n = q.shape[1]
+        H = q.shape[0]
+        mask = attention_mask[0, 0].detach().double().numpy()[:, :n] if attention_mask is not None else np.triu(np.full((n, n), -np.inf), 1)
+        kk, vv = np.repeat(k, H // k.shape[0], axis=0), np.repeat(v, H // k.shape[0], axis=0)
+        s = np.einsum("hie,hje->hij", q, kk) * scaling
         if softcap is not None:
             s = np.tanh(s / softcap) * softcap
         s = s + mask[None]
         s = s - s.max(axis=-1, keepdims=True)
         a = np.exp(s)
         a = a / a.sum(axis=-1, keepdims=True)
-        pos = cur["pos"]
-        vis = [(i, j) for i in pos for j in pos if mask[i, j] == 0]
-        qk = sum(q[:, i, :] * k[:, j, :] for i, j in vis)
-        av = sum(a[:, i, j][:, None] * v[:, j, :] for i, j in vis)
-        p0 = pairs.get(l, (0, 0, 0))
-        pairs[l] = (p0[0] + qk, p0[1] + av, p0[2] + len(vis))
-        z = np.einsum("hij,hje->hie", a, v)
+        for p in range(n):
+            for sl in slots(p):
+                put(l, sl, "q", q[:, p, :])
+                put(l, sl, "k", k[:, p, :])
+                put(l, sl, "v", v[:, p, :])
+                vis = [j for j in range(n) if mask[p, j] == 0]
+                if sl == "g":
+                    w = att.setdefault((l, "g"), [np.zeros((H, 2)), np.zeros((H, 2))])
+                    for j in vis:
+                        c = 0 if (j == 0 and cur["start"] == 1) else 1
+                        w[0][:, c] += a[:, p, j]
+                        w[1][:, c] += 1
+                else:
+                    w = att.setdefault((l, sl), [np.zeros((H, T)), np.zeros((H, T))])
+                    for j in vis:
+                        if j < T:
+                            w[0][:, j] += a[:, p, j]
+                            w[1][:, j] += 1
+        z = np.einsum("hij,hje->hie", a, vv)
         return torch.tensor(z.transpose(1, 0, 2)[None], dtype=query.dtype), torch.tensor(a[None], dtype=query.dtype)
 
     hooks = []
     for l, ly in enumerate(layers):
         for lin, names in linear_sites(ly, neox):
             def hook(mod_, inp, out, l=l, names=names):
-                x = inp[0][0].detach().double().numpy()[cur["pos"]].sum(axis=0)
-                for nm in names:
-                    sums[(l, nm)] = sums.get((l, nm), 0) + x
+                x = inp[0][0].detach().double().numpy()
+                for p in range(x.shape[0]):
+                    for sl in slots(p):
+                        for nm in names:
+                            put(l, sl, nm, x[p])
             hooks.append(lin.register_forward_hook(hook))
     mod.eager_attention_forward = rec_eager
     try:
         with torch.no_grad():
-            for toks, pos in zip(J["ref_tokens"], J["ref_positions"]):
-                cur["pos"] = pos
-                n += len(pos)
+            for toks, used in zip(J["ref_tokens"], J["ref_positions"]):
+                cur["start"] = used[0] if used else len(toks)
                 hf(torch.tensor([toks]))
     finally:
         for h in hooks:
             h.remove()
         mod.eager_attention_forward = orig
-    x = {key: val / n for key, val in sums.items()}
-    qk = {l: v[0] / v[2] for l, v in pairs.items()}
-    av = {l: v[1] / v[2] for l, v in pairs.items()}
+    L = len(layers)
+    H = hf.config.num_attention_heads
+
+    def mean(l, p, name):
+        a = acc.get((l, p, name))
+        if a is None:
+            a = acc[(l, "g", name)]
+        return a[0] / a[1]
+
+    x, qm, km, vm, am = {}, {}, {}, {}, {}
+    for l in range(L):
+        for p in range(T):
+            for nm in SITES:
+                if (l, "g", nm) in acc:
+                    x[(l, p, nm)] = mean(l, p, nm)
+            qm[(l, p)], km[(l, p)], vm[(l, p)] = mean(l, p, "q"), mean(l, p, "k"), mean(l, p, "v")
+            row = np.zeros((H, T))
+            w = att.get((l, p))
+            g = att[(l, "g")]
+            for h in range(H):
+                for j in range(T):
+                    if w is not None and w[1][h, j] > 0:
+                        row[h, j] = w[0][h, j] / w[1][h, j]
+                    else:
+                        c = 0 if (j == 0 and bos) else 1
+                        row[h, j] = g[0][h, c] / max(g[1][h, c], 1)
+            am[(l, p)] = row
     # how far apollon's own means are from these
     dev = 0.0
+    rel = lambda got, ref: float(np.abs(np.array(got).reshape(-1) - np.asarray(ref).reshape(-1)).max() / max(np.abs(ref).max(), 1e-12))
     for l, lm in enumerate(J["means"]):
-        for nm, vec in lm["x"].items():
-            ref = x[(l, nm)]
-            dev = max(dev, float(np.abs(np.array(vec) - ref).max() / max(np.abs(ref).max(), 1e-12)))
-        for key, ref in (("qk", qk[l]), ("av", av[l])):
-            ref = ref.reshape(-1)
-            dev = max(dev, float(np.abs(np.array(lm[key]) - ref).max() / max(np.abs(ref).max(), 1e-12)))
-    return {"x": x, "qk": qk, "av": av, "dev": dev}
+        for p, pm in enumerate(lm):
+            for key, ref in (("h", x[(l, p, "Q")]), ("h2", x[(l, p, "up")]), ("z", x[(l, p, "O")]), ("act", x[(l, p, "down")]), ("q", qm[(l, p)]), ("k", km[(l, p)]), ("v", vm[(l, p)]), ("a", am[(l, p)])):
+                d = rel(pm[key], ref)
+                if d > 1e-4 and os.environ.get("CIRCUIT_DEBUG"):
+                    print(f"    means {key} layer {l} position {p}: {d:.1e}")
+                dev = max(dev, d)
+    return {"x": x, "q": qm, "k": km, "v": vm, "a": am, "dev": dev}
 
 
 def apply_cut(hf, kind, J):
@@ -220,7 +276,7 @@ def apply_cut(hf, kind, J):
     # the norm scales of the full model and the means, both before any hook is in place
     full_scales = record_scales(hf, J["tokens"]) if J.get("frozen_norms") else None
     M = hf_means(hf, kind, J) if J.get("ablation") == "mean" else None
-    LAST["means_dev"] = M["dev"] if M else None
+    LAST["M"] = M
     cfg = hf.config
     neox = kind == "neox"
     layers = hf.gpt_neox.layers if neox else hf.model.layers
@@ -249,7 +305,7 @@ def apply_cut(hf, kind, J):
                     k = site.get((p, l, s))
                     if k is None:
                         continue
-                    xbar = M["x"][(l, s)] if M else None
+                    xbar = M["x"][(l, p, s)] if M else None
                     if s in ROW_WISE:
                         for u in range(k.shape[0]):
                             r = row_of(u)
@@ -304,7 +360,7 @@ def apply_cut(hf, kind, J):
                 kq = head.get((p, l, h, "qk"))
                 prod = q[h, p][None, :] * kh  # [T][hd] – every product q_e·k_e
                 if kq is not None:
-                    prod = prod * kq if M is None else np.where(kq, prod, M["qk"][l][h][None, :])
+                    prod = prod * kq if M is None else np.where(kq, prod, M["q"][(l, p)][h][None, :] * np.array([M["k"][(l, j)][h // rep] for j in range(T)]))
                 s = prod.sum(axis=1) * scaling
                 if softcap is not None:
                     s = np.tanh(s / softcap) * softcap
@@ -316,7 +372,7 @@ def apply_cut(hf, kind, J):
                 kv = head.get((p, l, h, "av"))
                 contrib = a[:, None] * vh  # [T][hd] – every product a_j·v_j[e]
                 if kv is not None:
-                    contrib = contrib * kv if M is None else np.where(kv, contrib, M["av"][l][h][None, :])
+                    contrib = contrib * kv if M is None else np.where(kv, contrib, np.array([M["a"][(l, p)][h, j] * M["v"][(l, j)][h // rep] for j in range(T)]))
                 z[h, p] = contrib.sum(axis=0)
         out = torch.tensor(z.transpose(1, 0, 2)[None], dtype=query.dtype)
         return out, torch.tensor(A[None], dtype=query.dtype)
@@ -345,11 +401,18 @@ def compare(hfs, kind, J, name, devs=None, label=None):
     """(deviation of apollon from the float64 reference, deviation of the float32 reference from it);
     with mean ablation also records how far apollon's means are from those computed here"""
     ref = reference(hfs[0], kind, J)
-    mdev = LAST.get("means_dev")
+    m64 = LAST.get("M")
     r32 = reference(hfs[1], kind, J)
+    m32 = LAST.get("M")
     rel = lambda a: float(np.abs(a - ref).max() / max(np.abs(ref).max(), 1e-12))
-    if devs is not None and mdev is not None:
-        devs[f"{label}: means"] = (mdev, 0.0)
+    if devs is not None and m64 is not None:
+        # apollon's means against these, and how far the same means in float32 are from float64
+        f32 = 0.0
+        for key in ("x", "q", "k", "v", "a"):
+            for kk, v64 in m64[key].items():
+                v32 = np.asarray(m32[key][kk])
+                f32 = max(f32, float(np.abs(v32 - v64).max() / max(np.abs(v64).max(), 1e-12)))
+        devs[f"{label}: means"] = (m64["dev"], f32)
     return rel(np.array(J["logits_circuit"], dtype=np.float64)), rel(r32)
 
 

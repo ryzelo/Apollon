@@ -273,13 +273,18 @@ default 0.1 nats) and **the same top token**.
 
 **What "switched off" means** (`--circuit-ablation`):
 
-* **mean** (default, the usual choice in circuit research): a switched-off atom is replaced by its **mean
-  over a reference distribution**. For a projection that is W[o,c]·x̄_c, with x̄ the mean input of that matrix
-  product over all reference positions; a unit switched off completely gives W·x̄. For a score or a mixing
-  it is the mean of q_e·k_e or a_j·v_j[e] over all (query, key) pairs the reference queries see. The
-  reference is the analyzed sequence itself, or the prompts given with `--circuit-ref "A; B; …"` (wrapped
-  like the prompt with `--chat` and completed with their own greedy answer). A leading `<bos>` is left out
-  of the means: it is an attention sink with untypical activations.
+* **mean** (default, the usual choice in circuit research): the activations in a switched-off atom are
+  replaced by their **means over a reference distribution**. Every atom is a product of two factors: in a
+  projection W[o,c]·x_c becomes W[o,c]·x̄_c (a unit switched off completely gives W·x̄), in a score q_e·k_e
+  becomes q̄_e·k̄_e, in a mixing a_j·v_j[e] becomes ā_j·v̄_j[e].
+  * With reference prompts – `--circuit-ref "A; B; …"`, same format as the prompt, wrapped like it with
+    `--chat` and completed with their own greedy answer – the means are taken **position by position**: at
+    position p over the references at position p (as in IOI-style work). The circuit then is what carries
+    the *difference* to the references – with other numbers, the numbers.
+  * Without references (or where no reference reaches a position), the mean over all positions of the
+    analyzed sequence is used.
+  * A leading `<bos>` stays itself: it is the same in every sequence (and an attention sink), so its mean is
+    its own activations.
 * **zero**: a switched-off atom is missing from its sum. This takes the model further off its usual
   distribution: whatever is removed leaves a hole that later layers never see in normal use.
 
@@ -362,7 +367,9 @@ key " Wednesday" [4], dimension 25.
   different order of tests can find a different one.
 * Mean ablation depends on the reference: the circuit explains the prediction *relative to* it. With
   similar prompts (other numbers, same format) the circuit is what carries the difference – the number –
-  rather than what produces the format.
+  rather than what produces the format. A first version averaged over all positions, `<bos>` excluded: on
+  Gemma 3 the search then mostly kept the attention sink at `<bos>` intact – a statement about the
+  reference, not about arithmetic.
 * A key whose score products are all off gets the score 0, not −∞: taking a key out of the softmax is not a
   matrix product, so it is not an atom.
 * The runtime grows with the size of the circuit (roughly 2 tests per atom in the final phase) and with the

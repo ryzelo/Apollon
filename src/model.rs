@@ -522,18 +522,53 @@ pub struct LayerCut {
 pub struct Cut {
     pub rows: Vec<Vec<Option<Arc<LayerCut>>>>,
     pub means: Option<Arc<Means>>,
+    /// real position of every row (the means are per position)
+    pub pos: Vec<u32>,
 }
 
-/// Mean ablation: what a switched-off atom stands for, per layer
+/// Mean ablation: what a switched-off atom stands for, per layer and position. Every atom is a product
+/// of two factors; switching it off replaces the activations among them by their means over the
+/// reference: W[o,c]·x_c -> W[o,c]·x̄_c, q_e·k_e -> q̄_e·k̄_e, a_j·v_j[e] -> ā_j·v̄_j[e].
 #[derive(Clone, Default)]
-pub struct LayerMeans {
-    /// per site the mean input: row-wise sites x̄ along the atoms [n_in], column-wise x̄ per unit [n_units]
-    pub x: [Vec<f32>; N_SITES],
+pub struct PosMeans {
+    /// mean inputs: h (Q/K/V), z (O), h2 (gate/up), act (down), ple_x (PLE gate), ple_g (PLE projection)
+    pub h: Vec<f32>,
+    pub z: Vec<f32>,
+    pub h2: Vec<f32>,
+    pub act: Vec<f32>,
+    pub ple_x: Vec<f32>,
+    pub ple_g: Vec<f32>,
+    /// the token vector (input of the PLE input projection)
+    pub tok: Vec<f32>,
     /// row-wise sites: W·x̄ per unit, i.e. what a unit switched off completely gives (before the bias)
     pub y: [Vec<f32>; N_SITES],
-    /// [nh][hd] mean of q_e·k_e and of a_j·v_j[e] over all (query, key) pairs of the reference
-    pub qk: Vec<f32>,
-    pub av: Vec<f32>,
+    /// q after norm + RoPE [nh*hd], k and v as attention reads them [kvd]
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    /// mean attention weight of this query position to every key position [nh][T]
+    pub a: Vec<f32>,
+}
+
+impl PosMeans {
+    /// the mean input of a site
+    pub fn x(&self, s: Site) -> &[f32] {
+        match s {
+            Site::Q | Site::K | Site::V => &self.h,
+            Site::O => &self.z,
+            Site::Gate | Site::Up => &self.h2,
+            Site::Down => &self.act,
+            Site::PleIn => &self.tok,
+            Site::PleGate => &self.ple_x,
+            Site::PleProj => &self.ple_g,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LayerMeans {
+    /// per position of the analyzed sequence
+    pub pos: Vec<PosMeans>,
 }
 
 #[derive(Clone, Default)]
@@ -554,9 +589,10 @@ impl Cut {
     fn head(&self, row: usize, l: usize, h: usize) -> Option<&HeadCut> {
         self.layer(row, l)?.heads.get(h)?.as_deref()
     }
+    /// the means of layer l at the position of row i
     #[inline]
-    fn lmeans(&self, l: usize) -> Option<&LayerMeans> {
-        self.means.as_deref().map(|m| &m.layers[l])
+    fn pmeans(&self, l: usize, i: usize) -> Option<&PosMeans> {
+        self.means.as_deref().map(|m| &m.layers[l].pos[self.pos[i] as usize])
     }
 }
 
@@ -567,9 +603,9 @@ impl Cut {
 fn cut_rows(y: &mut [f32], x: &[f32], t: usize, ny: usize, cut: Option<&Cut>, l: usize, s: Site, map: impl Fn(usize) -> usize + Sync) {
     let Some(c) = cut else { return };
     let nx = x.len() / t;
-    let ybar = c.lmeans(l).map(|m| &m.y[s as usize][..]);
     y[..t * ny].par_chunks_mut(ny).enumerate().for_each(|(i, yi)| {
         let Some(mc) = c.site(i, l, s) else { return };
+        let ybar = c.pmeans(l, i).map(|m| &m.y[s as usize][..]);
         let xi = &x[i * nx..(i + 1) * nx];
         for &u in &mc.off {
             yi[map(u as usize)] = ybar.map_or(0.0, |y| y[u as usize]);
@@ -606,10 +642,10 @@ fn cut_cols_in(x: &[f32], t: usize, cut: Option<&Cut>, l: usize, s: Site) -> Opt
         return None;
     }
     let nx = x.len() / t;
-    let xbar = c.lmeans(l).map(|m| &m.x[s as usize][..]);
     let mut v = x.to_vec();
     for i in 0..t {
         if let Some(mc) = c.site(i, l, s) {
+            let xbar = c.pmeans(l, i).map(|m| m.x(s));
             for &u in &mc.off {
                 v[i * nx + u as usize] = xbar.map_or(0.0, |xb| xb[u as usize]);
             }
@@ -960,19 +996,25 @@ impl Model {
                     let qi = &q[i * ad + hh * hd..][..hd];
                     let br = ranges(i);
                     let hc = cut.and_then(|c| c.head(i, l, hh));
-                    let lm = cut.and_then(|c| c.lmeans(l));
-                    let qkm = lm.map(|m| &m.qk[hh * hd..(hh + 1) * hd]);
-                    let avm = lm.map(|m| &m.av[hh * hd..(hh + 1) * hd]);
+                    // mean ablation: q̄ of this query position; k̄, v̄ and ā of the key position (below)
+                    let pm = cut.and_then(|c| c.pmeans(l, i));
+                    let km = |j: usize| cut.and_then(|c| c.pmeans(l, j));
+                    let qbar = pm.map(|m| &m.q[hh * hd..(hh + 1) * hd]);
                     let mut mx = f32::NEG_INFINITY;
                     for &(lo, hi) in &br {
                         for j in lo..hi {
                             let kj = &k[j * kvd + g * hd..][..hd];
-                            let raw = match (hc.map(|c| c.qk.mode(posi(j) as u32)), qkm) {
+                            let raw = match (hc.map(|c| c.qk.mode(posi(j) as u32)), qbar) {
                                 (None | Some(KeyMode::On), _) => dot(qi, kj),
                                 (Some(KeyMode::Off), None) => 0.0,
                                 (Some(KeyMode::Partial(at)), None) => (0..hd).filter(|&e| !at.is_off(e as u32)).map(|e| qi[e] * kj[e]).sum(),
-                                (Some(KeyMode::Off), Some(m)) => m.iter().sum(),
-                                (Some(KeyMode::Partial(at)), Some(m)) => (0..hd).map(|e| if at.is_off(e as u32) { m[e] } else { qi[e] * kj[e] }).sum(),
+                                (Some(mode), Some(qb)) => {
+                                    let kb = &km(j).unwrap().k[g * hd..(g + 1) * hd];
+                                    match mode {
+                                        KeyMode::Partial(at) => (0..hd).map(|e| if at.is_off(e as u32) { qb[e] * kb[e] } else { qi[e] * kj[e] }).sum(),
+                                        _ => dot(qb, kb),
+                                    }
+                                }
                             };
                             let mut sc = raw * a.scale;
                             if let Some(c) = a.softcap {
@@ -993,7 +1035,7 @@ impl Model {
                         for j in lo..hi {
                             s[j] /= sum;
                             let vj = &v[j * kvd + g * hd..][..hd];
-                            match (hc.map(|c| c.av.mode(posi(j) as u32)), avm) {
+                            match (hc.map(|c| c.av.mode(posi(j) as u32)), pm) {
                                 (None | Some(KeyMode::On), _) => {
                                     for e in 0..hd {
                                         zi[e] += s[j] * vj[e];
@@ -1007,14 +1049,16 @@ impl Model {
                                         }
                                     }
                                 }
-                                (Some(KeyMode::Off), Some(m)) => {
+                                (Some(mode), Some(m)) => {
+                                    // ā of (this query position, the key position) times v̄ of the key position
+                                    let abar = m.a[hh * m.a.len() / nh + posi(j)];
+                                    let vb = &km(j).unwrap().v[g * hd..(g + 1) * hd];
                                     for e in 0..hd {
-                                        zi[e] += m[e];
-                                    }
-                                }
-                                (Some(KeyMode::Partial(at)), Some(m)) => {
-                                    for e in 0..hd {
-                                        zi[e] += if at.is_off(e as u32) { m[e] } else { s[j] * vj[e] };
+                                        let off = match mode {
+                                            KeyMode::Partial(at) => at.is_off(e as u32),
+                                            _ => true,
+                                        };
+                                        zi[e] += if off { abar * vb[e] } else { s[j] * vj[e] };
                                     }
                                 }
                             }

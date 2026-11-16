@@ -21,7 +21,7 @@
 //! output is switched off, or their input is exactly zero) are switched off without a test, and the
 //! output has to stay bit-identical.
 use crate::fmt::{chip, esc_html, esc_piece, num, pct, prompt_html, sci, thousands, tok, Style, CSS};
-use crate::model::{Atoms, Checkpoint, Cut, HeadCut, KeyCut, LayerCut, LayerInputs, LayerMeans, MatCut, Means, Model, NormScales, PartialUnit, RunOpts, Site, Start, Variants, N_SITES};
+use crate::model::{Atoms, Checkpoint, Cut, HeadCut, KeyCut, LayerCut, LayerInputs, LayerMeans, MatCut, Means, Model, NormScales, PartialUnit, PosMeans, RunOpts, Site, Start, Variants, N_SITES};
 use crate::probe::{read_out_fz, Out, NY};
 use crate::readout::{columns, softmax};
 use crate::tensor::Mat;
@@ -556,13 +556,13 @@ impl<'a> Builder<'a> {
         self.col_norms.borrow_mut().insert((l, s), v.clone());
         v
     }
-    fn site(&self, set: &SetB, l: usize, s: Site, g: &Geo) -> Option<Arc<MatCut>> {
+    fn site(&self, set: &SetB, l: usize, p: usize, s: Site, g: &Geo) -> Option<Arc<MatCut>> {
         if set.is_empty() {
             return None;
         }
         let n = g.d;
         let off: Vec<u32> = if set.all { (0..g.units(l, s) as u32).collect() } else { set.off.iter().copied().collect() };
-        let xb = self.means.as_ref().map(|m| &m.layers[l].x[s as usize]);
+        let xb = self.means.as_ref().map(|m| m.layers[l].pos[p].x(s));
         // column-wise: one row of the output (W_O split by heads: [head][d])
         let hd = g.layers[l].hd;
         let ny = if s == Site::O { g.layers[l].nh * g.d } else { g.d };
@@ -591,13 +591,13 @@ impl<'a> Builder<'a> {
         };
         Some(Arc::new(MatCut { off, partial, mean_add: mean_add.map(Arc::new) }))
     }
-    fn cell(&self, c: &CellB, l: usize, g: &Geo) -> Option<Arc<LayerCut>> {
+    fn cell(&self, c: &CellB, l: usize, p: usize, g: &Geo) -> Option<Arc<LayerCut>> {
         if c.is_empty() {
             return None;
         }
         let mut lc = LayerCut::default();
         for s in ALL_SITES {
-            lc.sites[s as usize] = self.site(&c.sites[s as usize], l, s, g);
+            lc.sites[s as usize] = self.site(&c.sites[s as usize], l, p, s, g);
         }
         let hd = g.layers[l].hd;
         lc.heads = c.heads.iter().map(|h| head_cut(h, hd)).collect();
@@ -687,7 +687,8 @@ impl<'a> Engine<'a> {
     }
     /// a standalone run with this cut (and the frozen norms, if any)
     fn opts(&self, rows: RowCuts) -> RunOpts {
-        RunOpts { cut: Some(Arc::new(Cut { rows, means: self.means.clone() })), frozen_norms: self.fz.clone(), keep_final: true, ..Default::default() }
+        let pos = (0..rows.len() as u32).collect();
+        RunOpts { cut: Some(Arc::new(Cut { rows, means: self.means.clone(), pos })), frozen_norms: self.fz.clone(), keep_final: true, ..Default::default() }
     }
     fn ok(&self, o: &Out, limit: f32) -> bool {
         o.kl <= limit && o.top[0].0 == self.top_ref
@@ -740,7 +741,7 @@ impl<'a> Engine<'a> {
             lc.heads = vec![None; nh];
         }
         for (s, sb) in &sites {
-            lc.sites[*s] = self.b.site(sb, l, ALL_SITES[*s], &self.g);
+            lc.sites[*s] = self.b.site(sb, l, p, ALL_SITES[*s], &self.g);
         }
         for (h, hb) in &heads {
             lc.heads[*h] = head_cut(hb, hd);
@@ -822,11 +823,12 @@ impl<'a> Engine<'a> {
                     })
                 })
                 .collect();
+            let pos_rows: Vec<u32> = pos.iter().map(|&q| q as u32).collect();
             let o = RunOpts {
                 keep_final: true,
                 start: Some(Start { layer: l0, x, kv: Arc::new(kv) }),
-                variants: Some(Arc::new(Variants { pos, seg_start, seg_row0 })),
-                cut: Some(Arc::new(Cut { rows: cut_rows, means: self.means.clone() })),
+                variants: Some(Arc::new(Variants { pos: pos.clone(), seg_start, seg_row0 })),
+                cut: Some(Arc::new(Cut { rows: cut_rows, means: self.means.clone(), pos: pos_rows })),
                 frozen_norms: self.fz.clone(),
                 ..Default::default()
             };
@@ -858,7 +860,7 @@ impl<'a> Engine<'a> {
     /// rebuild the cut of the cells touched by `cand`
     fn rebuild(&mut self, cells: impl Iterator<Item = (usize, usize)>) {
         for (p, l) in cells {
-            self.built[p][l] = self.b.cell(&self.state.cells[p][l], l, &self.g);
+            self.built[p][l] = self.b.cell(&self.state.cells[p][l], l, p, &self.g);
         }
     }
 
@@ -1703,75 +1705,160 @@ impl<'a> Engine<'a> {
 
 // ====================================================================== mean ablation
 
-/// The means over the reference sequences – every position, except a leading special token such as
-/// <bos> (an attention sink with untypical activations): the input of every matrix product, W·x̄ for
-/// the row-wise sites, and q_e·k_e and a_j·v_j[e] over all (query, key) pairs a query sees.
-/// Returns the means and the positions used per reference.
-fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>]) -> (Means, Vec<Vec<usize>>) {
-    let (nl, d) = (g.layers.len(), g.d);
-    let in_len = |l: usize, s: Site| if s.row_wise() { d } else { g.units(l, s) };
-    let mut xs: Vec<Vec<Vec<f64>>> = (0..nl).map(|l| ALL_SITES.iter().map(|&s| if g.has(l, s) { vec![0f64; in_len(l, s)] } else { Vec::new() }).collect()).collect();
-    let mut qk: Vec<Vec<f64>> = g.layers.iter().map(|lg| vec![0f64; lg.nh * lg.hd]).collect();
-    let mut av = qk.clone();
-    let (mut n, mut pairs) = (0f64, vec![0f64; nl]);
-    let mut positions = Vec::new();
+/// The means for mean ablation, per layer and position of the analyzed sequence (T positions).
+///
+/// * With reference prompts (`--circuit-ref`, same format): position-wise – at position p the mean over
+///   the references that have a position p, as is usual in circuit work (IOI and the like).
+/// * Without, or where no reference reaches p: the mean over all positions of the references (the
+///   analyzed sequence itself by default), except a leading special token.
+/// * A leading special token (<bos>) is context-free – the same activations in every sequence – so at
+///   position 0 its own activations are the mean: switching off atoms there changes nothing.
+///
+/// Means are taken of the inputs of every matrix product and of the factors of QKᵀ and A·V (q after norm
+/// and RoPE, k, v, the attention weights per query/key position; for the weights the fallback is the
+/// mean weight on <bos> or on any other key). W·x̄ is precomputed for the row-wise sites.
+/// Returns the means and, per reference, the positions it contributed to the fallback.
+fn compute_means(m: &Model, g: &Geo, b: &Builder, refs: &[Vec<u32>], ids: &[u32], positionwise: bool) -> (Means, Vec<Vec<usize>>) {
+    let (nl, d, t) = (g.layers.len(), g.d, ids.len());
+    let bos = m.tok.is_special(ids[0]);
+    // per layer: one slot per position (0..t) and a global slot (t)
+    #[derive(Clone, Default)]
+    struct Acc {
+        h: Vec<f64>,
+        z: Vec<f64>,
+        h2: Vec<f64>,
+        act: Vec<f64>,
+        ple_x: Vec<f64>,
+        ple_g: Vec<f64>,
+        tok: Vec<f64>,
+        q: Vec<f64>,
+        k: Vec<f64>,
+        v: Vec<f64>,
+        /// position slots [nh][t]; global slot [nh][2] = on <bos>, on any other key
+        a: Vec<f64>,
+        an: Vec<f64>,
+        n: f64,
+    }
+    fn add(acc: &mut Vec<f64>, x: &[f32]) {
+        if acc.is_empty() {
+            acc.resize(x.len(), 0.0);
+        }
+        for (a, v) in acc.iter_mut().zip(x) {
+            *a += *v as f64;
+        }
+    }
+    let mut accs: Vec<Vec<Acc>> = vec![vec![Acc::default(); t + 1]; nl];
+    let mut used = Vec::new();
     for r in refs {
-        let t = r.len();
-        let tr = m.run(r, t - 1, &RunOpts { record_inputs: true, ..Default::default() });
-        let start = usize::from(t > 1 && m.tok.is_special(r[0]));
-        let pos: Vec<usize> = (start..t).collect();
-        n += pos.len() as f64;
+        let rt = r.len();
+        let tr = m.run(r, rt - 1, &RunOpts { record_inputs: true, ..Default::default() });
+        let start = usize::from(rt > 1 && m.tok.is_special(r[0]));
+        used.push((start..rt).collect::<Vec<_>>());
         for (l, li) in tr.inputs.iter().enumerate() {
             let lg = &g.layers[l];
-            for (si, &s) in ALL_SITES.iter().enumerate() {
-                if !g.has(l, s) {
-                    continue;
-                }
-                for &p in &pos {
-                    for (a, v) in xs[l][si].iter_mut().zip(site_input(li, &tr.x_tok, s, p, d)) {
-                        *a += *v as f64;
-                    }
-                }
-            }
             let (nh, hd) = (lg.nh, lg.hd);
-            let (ad, kvd, rep) = (nh * hd, lg.nkv * hd, nh / lg.nkv);
-            for &i in &pos {
-                for j in g.keys(l, i).filter(|&j| j >= start) {
-                    pairs[l] += 1.0;
-                    for h in 0..nh {
-                        let gr = h / rep;
-                        let a = li.probs[(i * nh + h) * t + j] as f64;
-                        for e in 0..hd {
-                            qk[l][h * hd + e] += (li.q[i * ad + h * hd + e] * li.k[j * kvd + gr * hd + e]) as f64;
-                            av[l][h * hd + e] += a * li.v[j * kvd + gr * hd + e] as f64;
+            let (ad, kvd) = (nh * hd, lg.nkv * hd);
+            for p in 0..rt {
+                // the slot of position p (position-wise, and position 0 for <bos>) and the global slot
+                let mut slots = Vec::new();
+                if p < t && (positionwise || (p == 0 && bos && start == 1)) {
+                    slots.push(p);
+                }
+                if p >= start {
+                    slots.push(t);
+                }
+                for &sl in &slots {
+                    let a = &mut accs[l][sl];
+                    a.n += 1.0;
+                    add(&mut a.h, &li.h[p * d..(p + 1) * d]);
+                    add(&mut a.h2, &li.h2[p * d..(p + 1) * d]);
+                    add(&mut a.z, site_input(li, &tr.x_tok, Site::O, p, d));
+                    add(&mut a.act, site_input(li, &tr.x_tok, Site::Down, p, d));
+                    if lg.dp.is_some() {
+                        add(&mut a.ple_x, &li.ple_x[p * d..(p + 1) * d]);
+                        add(&mut a.ple_g, site_input(li, &tr.x_tok, Site::PleProj, p, d));
+                    }
+                    add(&mut a.tok, &tr.x_tok[p * d..(p + 1) * d]);
+                    add(&mut a.q, &li.q[p * ad..(p + 1) * ad]);
+                    add(&mut a.k, &li.k[p * kvd..(p + 1) * kvd]);
+                    add(&mut a.v, &li.v[p * kvd..(p + 1) * kvd]);
+                    if sl < t {
+                        if a.a.is_empty() {
+                            a.a = vec![0.0; nh * t];
+                            a.an = vec![0.0; nh * t];
+                        }
+                        for h in 0..nh {
+                            for j in g.keys(l, p).filter(|&j| j < t) {
+                                a.a[h * t + j] += li.probs[(p * nh + h) * rt + j] as f64;
+                                a.an[h * t + j] += 1.0;
+                            }
+                        }
+                    } else {
+                        if a.a.is_empty() {
+                            a.a = vec![0.0; nh * 2];
+                            a.an = vec![0.0; nh * 2];
+                        }
+                        for h in 0..nh {
+                            for j in g.keys(l, p) {
+                                let c = usize::from(!(j == 0 && start == 1));
+                                a.a[h * 2 + c] += li.probs[(p * nh + h) * rt + j] as f64;
+                                a.an[h * 2 + c] += 1.0;
+                            }
                         }
                     }
                 }
             }
         }
-        positions.push(pos);
     }
-    let mut layers: Vec<LayerMeans> = Vec::with_capacity(nl);
+    let mean = |v: &[f64], n: f64| -> Vec<f32> { v.iter().map(|x| (x / n.max(1.0)) as f32).collect() };
+    let mut layers = Vec::with_capacity(nl);
     for l in 0..nl {
-        let mut lm = LayerMeans::default();
-        for (si, &s) in ALL_SITES.iter().enumerate() {
-            if !g.has(l, s) {
-                continue;
+        let nh = g.layers[l].nh;
+        let glob = &accs[l][t];
+        let mut pos = Vec::with_capacity(t);
+        for p in 0..t {
+            let a = &accs[l][p];
+            let src = if a.n > 0.0 { a } else { glob };
+            let mut pm = PosMeans {
+                h: mean(&src.h, src.n),
+                z: mean(&src.z, src.n),
+                h2: mean(&src.h2, src.n),
+                act: mean(&src.act, src.n),
+                ple_x: mean(&src.ple_x, src.n),
+                ple_g: mean(&src.ple_g, src.n),
+                tok: mean(&src.tok, src.n),
+                q: mean(&src.q, src.n),
+                k: mean(&src.k, src.n),
+                v: mean(&src.v, src.n),
+                ..Default::default()
+            };
+            // attention weights: of this query position where known, else the global mean weight on
+            // <bos> / on any other key
+            pm.a = vec![0f32; nh * t];
+            for h in 0..nh {
+                for j in 0..t {
+                    let known = a.n > 0.0 && a.an.get(h * t + j).is_some_and(|&c| c > 0.0);
+                    pm.a[h * t + j] = if known {
+                        (a.a[h * t + j] / a.an[h * t + j]) as f32
+                    } else {
+                        let c = usize::from(!(j == 0 && bos));
+                        (glob.a.get(h * 2 + c).copied().unwrap_or(0.0) / glob.an.get(h * 2 + c).copied().unwrap_or(1.0).max(1.0)) as f32
+                    };
+                }
             }
-            let xb: Vec<f32> = xs[l][si].iter().map(|v| (v / n.max(1.0)) as f32).collect();
-            if s.row_wise() {
+            for s in ALL_SITES {
+                if !g.has(l, s) || !s.row_wise() {
+                    continue;
+                }
                 let (mat, map) = b.mat(l, s);
-                let full = mat.matmul(&xb, 1);
-                lm.y[si] = (0..g.units(l, s)).map(|u| full[map(u)]).collect();
+                let full = mat.matmul(pm.x(s), 1);
+                pm.y[s as usize] = (0..g.units(l, s)).map(|u| full[map(u)]).collect();
             }
-            lm.x[si] = xb;
+            pos.push(pm);
         }
-        let np = pairs[l].max(1.0);
-        lm.qk = qk[l].iter().map(|v| (v / np) as f32).collect();
-        lm.av = av[l].iter().map(|v| (v / np) as f32).collect();
-        layers.push(lm);
+        layers.push(LayerMeans { pos });
     }
-    (Means { layers }, positions)
+    (Means { layers }, used)
 }
 
 // ====================================================================== flow
@@ -1825,7 +1912,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     let mut b = Builder { m, means: None, w: RefCell::new(HashMap::new()), col_norms: RefCell::new(HashMap::new()) };
     let refs: Vec<Vec<u32>> = if o.refs.is_empty() { vec![ids.to_vec()] } else { o.refs.clone() };
     let (means, ref_pos) = if o.mean {
-        let (mn, pos) = compute_means(m, &g, &b, &refs);
+        let (mn, pos) = compute_means(m, &g, &b, &refs, ids, !o.refs.is_empty());
         (Some(Arc::new(mn)), pos)
     } else {
         (None, Vec::new())
@@ -2143,7 +2230,7 @@ fn complement(e: &Engine) -> RowCuts {
                     }
                 }
             }
-            layers.push(e.b.cell(&inv, l, g));
+            layers.push(e.b.cell(&inv, l, p, g));
         }
         rows.push(layers);
     }
@@ -2315,10 +2402,8 @@ fn terminal(r: &Report, st: &Style) {
 fn ablation_txt(r: &Report) -> String {
     if r.o.mean {
         format!(
-            "mean ablation: a switched-off atom is replaced by its mean over {} reference position(s) in {} sequence(s){}",
-            r.ref_pos.iter().map(|p| p.len()).sum::<usize>(),
-            r.refs.len(),
-            if r.o.refs.is_empty() { " (the analyzed sequence itself; --circuit-ref gives others)" } else { "" }
+            "mean ablation: the activations in a switched-off atom are replaced by their means over {} (<bos> stays itself)",
+            if r.o.refs.is_empty() { "all positions of the analyzed sequence (--circuit-ref gives reference prompts)".to_string() } else { format!("{} reference prompts, position by position", r.refs.len()) }
         )
     } else {
         "zero ablation: a switched-off atom is missing from its sum".into()
@@ -2524,11 +2609,11 @@ fn dump_json(r: &Report, full_logits: &[f32]) -> String {
         "ablation": if r.o.mean { "mean" } else { "zero" },
         "ref_tokens": r.refs,
         "ref_positions": r.ref_pos,
-        "means": e.means.as_ref().map(|mn| mn.layers.iter().map(|lm| json!({
-            "x": ALL_SITES.iter().filter(|&&s| !lm.x[s as usize].is_empty()).map(|&s| (s.name().to_string(), json!(lm.x[s as usize]))).collect::<Map<String, Value>>(),
-            "qk": lm.qk,
-            "av": lm.av,
-        })).collect::<Vec<_>>()),
+        "positionwise": !r.o.refs.is_empty(),
+        "bos": e.m.tok.is_special(r.ids[0]),
+        "means": e.means.as_ref().map(|mn| mn.layers.iter().map(|lm| lm.pos.iter().map(|pm| json!({
+            "h": pm.h, "z": pm.z, "h2": pm.h2, "act": pm.act, "q": pm.q, "k": pm.k, "v": pm.v, "a": pm.a,
+        })).collect::<Vec<_>>()).collect::<Vec<_>>()),
         "top": e.top_ref,
         "cells": cells,
         "logits_full": full_logits,

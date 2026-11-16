@@ -221,7 +221,9 @@ pub(crate) fn read_out_fz(m: &Model, xs: &[f32], ys: &[u32; NY], p_ref: &[f32], 
             for (o, (l, id)) in a.top.iter_mut().zip(s.top) {
                 *o = (id, (l as f64 - lse).exp() as f32);
             }
-            a.kl = (ref_plp - s.pl + lse * psum).max(0.0) as f32;
+            // (a NaN stays NaN: it must not pass as KL 0)
+            let kl = ref_plp - s.pl + lse * psum;
+            a.kl = if kl.is_nan() { f32::NAN } else { kl.max(0.0) as f32 };
             a
         })
         .collect()
