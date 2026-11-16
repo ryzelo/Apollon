@@ -8,6 +8,10 @@ on:
 jobs:
   rust:
     name: cargo test (${{ matrix.os }})
+    # Build portable code: RUSTFLAGS replaces target-cpu=native from .cargo/config.toml, which breaks
+    # cached build artifacts when the next runner has a different CPU (illegal instruction).
+    env:
+      RUSTFLAGS: --cfg ci
     strategy:
       fail-fast: false
       matrix:
