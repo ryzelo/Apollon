@@ -1,9 +1,11 @@
 //! apollon – what does every part of a transformer contribute to one prediction?
 //!
-//! Two analyses of a single prompt, both exact for this one forward pass:
+//! Analyses of a single prompt, exact for this one forward pass:
 //! --decompose  every change of the residual stream as a token voice, with its total effect by rerun
 //! --probe      brute-force test bench for one component (neurons, PLE dimensions or heads)
+//! --trace      one neuron down to single scalar products (--neuron, --atlas: static, no prompt)
 //! --circuit    exact circuit search down to single scalar products
+//! --serve      the local web workspace
 mod atlas;
 mod export;
 mod server;

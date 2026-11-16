@@ -785,8 +785,8 @@ fn terminal(c: &Ctx, st: &Style) {
         let tl = &c.parts.parts[ri];
         let s = &e.voices[ri];
         let (dd, gs, is) = effects(e, ri, k, 0);
-        let gst = gs.map_or("–".to_string(), factor);
-        let ist = is.map_or("–".to_string(), factor);
+        let total_txt = gs.map_or("–".to_string(), factor);
+        let ind_txt = is.map_or("–".to_string(), factor);
         let color = |txt: String, x: Option<f32>| -> String {
             match x {
                 Some(x) if x > 0.693 => st.green(&txt),
@@ -809,8 +809,8 @@ fn terminal(c: &Ctx, st: &Style) {
             vt + &" ".repeat(ws.saturating_sub(vlen)),
             padl(&num(s.h, 1), 5),
             color(padl(&factor(dd), 8), Some(dd)),
-            color(padl(&gst, 9), gs),
-            color(padl(&ist, 9), is),
+            color(padl(&total_txt, 9), gs),
+            color(padl(&ind_txt, 9), is),
             st.dim(&padl(&nt.map_or("–".to_string(), factor), 9)),
             padl(&kl, 5),
             padl(&share, 5),

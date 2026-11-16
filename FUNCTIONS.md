@@ -1,6 +1,6 @@
 # apollon – what the code actually does (as of 2026-11-16, including the circuit search)
 
-All files in `src/` (≈ 10,170 lines of Rust) and `tests/` (8 Python scripts, plus Rust unit tests) were read.
+All files in `src/` (≈ 15,500 lines of Rust, plus the GPU kernels in `src/gpu/kernels.h`) and `tests/` (8 Python scripts, plus Rust unit tests) were read.
 There is no ML framework: apollon computes the forward pass itself. That is why it can record, split up and
 rerun every intermediate quantity from any layer.
 
@@ -15,6 +15,8 @@ main()
  │    ├─ model::load_gguf()           GGUF (llama, mistral, qwen2, qwen3, gemma4)
  │    └─ model::load_hf()             safetensors incl. MLX 4-bit (also gemma3, gpt_neox, gpt_neo, bert/roberta)
  ├─ describe(m)                       architecture line on stderr
+ ├─ --serve → server::serve()         the local web workspace (every analysis runs as a separate CLI process)
+ ├─ gpu::init(--gpu)                  Metal / CUDA / CPU for the matrix products
  ├─ statics()                         no prompt needed: --neuron → inspect::run(), --atlas (without --trace) → atlas::build()
  └─ analyze()
       ├─ Tokenizer.encode(prompt)     (optionally chat_wrap first)
@@ -39,7 +41,7 @@ report and write an HTML file (the atlas writes a binary file).
 
 ## 2. Functions per file
 
-### `main.rs` – CLI, finding models, flow (723 lines)
+### `main.rs` – CLI, finding models, flow (940 lines)
 | Function | What it actually does |
 |---|---|
 | `parse_args` | Reads all options. Free words become the prompt. `--probe "A; B"`, `--trace` and `--neuron` are split at `;`. `--atlas-layers A..B` is a half-open range. Hidden: `--selftest-dequant TYPE IN OUT` unpacks raw GGML blocks (tests only). |
@@ -63,7 +65,7 @@ report and write an HTML file (the atlas writes a binary file).
 | `analyze` | Tokenizes, checks the ids, sets the focus and branches (see the flow). |
 | `main` | Entry: threads, color, loading, timing. |
 
-### `model.rs` – transformer as a construction kit + loaders (1,671 lines)
+### `model.rs` – transformer as a construction kit + loaders (2,284 lines)
 **Components**
 | Function | What it does |
 |---|---|
@@ -111,7 +113,7 @@ report and write an HTML file (the atlas writes a binary file).
 | `read_json`, `hf_tokenizer` | Tokenizer from `tokenizer.json` or `vocab.json` + `merges.txt`. |
 | `load_hf` | Llama/Mistral/Qwen2/3/Gemma 3/4 (finds the weight prefix, also `language_model.`), GPT-NeoX (parallel residual, partial RoPE), GPT-Neo (local/global, no score scaling), BERT/RoBERTa (post-LN, encoder without head). Gemma 3: norm weights +1. Gemma: `<bos>` is prepended. |
 
-### `decompose.rs` – `--decompose` (1,066 lines)
+### `decompose.rs` – `--decompose` (1,129 lines)
 | Function | What it does |
 |---|---|
 | `Kind::is_change` | Whether a part is a "change" (embedding, attn, MLP, PLE, final bias) or a sub-part (head, source, neuron, bias). |
@@ -129,7 +131,7 @@ report and write an HTML file (the atlas writes a binary file).
 | `terminal` | Terminal report: checks, table of all changes (direct / total / indirect / via norm / KL / direct share / gains / losses), "strongest direct", "strongest overall", "hidden partial beliefs" (direct share < 25%), the 4 strongest changes expanded. |
 | `shift_html`, `dp_html`, `voice_html`, `opt_factor_html`, `sharpness`, `part_row`, `html` | The same as an expandable HTML page (heads → source positions, neurons). |
 
-### `probe.rs` – `--probe "S12 MLP"` (1,218 lines)
+### `probe.rs` – `--probe "S12 MLP"` (1,306 lines)
 | Function | What it does |
 |---|---|
 | `pos_label` | "[7]" or "[all]". |
@@ -161,7 +163,7 @@ report and write an HTML file (the atlas writes a binary file).
 | `parse_part`, `PartSpec` | "S12 MLP" / "S11 PLE" / "S12 Attn" / "S12 #2328" (also "S12 neuron 2328"); shared by probe and trace. |
 | Unit tests | Ellipse extremes against random samples on the sphere (2–32 dimensions, all activations), degenerate cases (g' ∥ u', u' = 0, g' = 0, both 0), z* hits the boundary point. |
 
-### `trace.rs` – `--trace` (1,591 lines)
+### `trace.rs` – `--trace` (1,681 lines)
 | Function | What it does |
 |---|---|
 | `source_vector_at`, `source_vector` | Vector of a source at any position and read point (runtime, with the frozen scales recorded at that position). |
@@ -176,7 +178,7 @@ report and write an HTML file (the atlas writes a binary file).
 | `parse_src` | `--scalars-of`: "token", "position", "S14 head 1", "S14 head 1 @16", "S14 #868", "S3 PLE #5", "S4 attn bias", "S4 MLP bias". |
 | `run`, `terminal`, `html`, `dump_json` | Flow, report, HTML with the (p,q) plane (whole and zoomed), sources → scalars, pairs, reruns, zoom tree; JSON for `tests/compare_neuron.py` (incl. z* and the phase-2 split of the strongest atom from layer 1 on). With `--atlas`: static rank of the strong sources, check stored arrow × scales × activation = runtime contribution and stored repertoire = recomputed. |
 
-### `inspect.rs` – `--neuron` (478 lines)
+### `inspect.rs` – `--neuron` (512 lines)
 | Function | What it does |
 |---|---|
 | `compute`, `run`, `terminal`, `html_report` | Static report: read vectors, repertoire, inputs by source kind, outputs. Checks: inputs adjoint = forward, outputs read by rows = read by columns. |
@@ -188,7 +190,7 @@ report and write an HTML file (the atlas writes a binary file).
 | `build` | Per target layer: the read vectors of all its neurons as rows; GEMM against vocabulary blocks (token inputs and, in the same pass, every neuron's voice), learned positions, biases, W_down of every earlier layer in column blocks (`gemm_nn`), PLE projections. Every tile is reduced at once to the top k per row (inputs) and per column (outputs of earlier neurons, written directly into the mapped file). Repertoire per neuron. Progress on stderr, resumable via done flags in the header; entries are deduplicated, so a repeated layer gives the same file. Self-check per layer (strongest input = on-demand result) and at the end for the outputs. |
 | `Atlas::open`, `record`, `Entry`, `TopK` | mmap read access; one record per neuron: repertoire + six lists (inputs by \|p\| / \|q\|, outputs by \|p\| / \|q\|, voice up / down). |
 
-### `circuit.rs` – `--circuit` (circuit search down to single scalar products)
+### `circuit.rs` – `--circuit` (circuit search down to single scalar products, 2,627 lines)
 | Function | What it does |
 |---|---|
 | `Geo` | Shape of the model per layer: heads, head size, K/V groups, FFN width, gated or not, up bias, own K/V, V site (not with V = K), window, PLE width; `readers[l]`: the layers whose attention reads the K/V of layer l (shared K/V). `keys(l, p)`: the keys a query at p sees. `cell_atoms`: all atoms of one (layer, position). |
@@ -222,7 +224,23 @@ report and write an HTML file (the atlas writes a binary file).
 | `metal.rs` | Pipelines from the kernel source (fast math off). Weights: per tensor a buffer over the pages it lies in, without a copy (a whole file can exceed Metal's largest buffer, e.g. Gemma 4 E4B with 5.3 GB). Inputs / unpacked rows / results in shared scratch buffers that grow. GEMM through `MPSMatrixMultiplication` (cached per shape), the own `gemm_sg` with `APOLLON_METAL_OWN_GEMM=1`. Every product drains an autorelease pool. `APOLLON_GPU_TIMING=1` prints GPU and copy times. |
 | `cuda.rs` | Driver API and NVRTC through `libloading` (several library names per platform); compiles the kernels with `--gpu-architecture=compute_XY` of the device; every weight tensor copied once; the same schedule with `gemm_nt`. On an error a product falls back to the CPU with a message. Not yet run on NVIDIA hardware; the kernel source translates to PTX with clang. |
 
-### `readout.rs` – reading vectors as token distributions (228 lines)
+### `server.rs` – `--serve` (local web workspace, 517 lines)
+| Function | What it does |
+|---|---|
+| `serve` | axum server on 127.0.0.1 (`$APOLLON_PORT`, default 8765): the API below, and `web/dist` (the built frontend) for everything else. Loads earlier runs from `output/web-runs/`; a run interrupted by shutdown is marked interrupted. |
+| `local_only`, `trusted` | Only the loopback host names are served; requests with a foreign `Origin` are refused. |
+| `models`, `scan_models` | `GET /api/models`: the local models (a separate `--list` process, cached for a minute). |
+| `create`, `worker`, `execute` | `POST /api/runs`: checks the request (model, prompt, kind ∈ generate / decompose / probe / trace / neuron / atlas / tokens / dump, answer 1–256, a component where needed), stores it, and runs it as a separate apollon process with `--result-json` (one at a time, a semaphore); the structured result and the HTML report land in the run's folder. |
+| `cancel`, `remove`, `list`, `detail`, `progress` | Cancel a queued or running run (the process is killed), delete a finished one with its files, list runs, one run with its last progress line. |
+| `artifacts`, `artifact`, `artifact_paths` | The files of a run (reports, exports) for download. |
+| `save` | A run's `job.json`, written atomically (temporary file + rename). |
+
+### `export.rs` – `--result-json`
+| Function | What it does |
+|---|---|
+| `tokens`, `probabilities`, `result`, `write` | The common part of a structured result (schema version 2): model, tokens, focus, target, mode, output distribution; each analysis adds its own fields (decompose, probe, trace, neuron) before `write` stores the JSON. |
+
+### `readout.rs` – reading vectors as token distributions (226 lines)
 | Function | What it does |
 |---|---|
 | `sum` | Sum in 16 lanes. |
@@ -233,7 +251,7 @@ report and write an HTML file (the atlas writes a binary file).
 | `columns` | Selected columns of a matrix (e.g. W_down[:, i]). |
 | `softmax` | (logZ, p) of the real logits. |
 
-### `tensor.rs` – matrix directly on the mapped file (275 lines)
+### `tensor.rs` – matrix directly on the mapped file (326 lines)
 | Function | What it does |
 |---|---|
 | `scalar` | Single F32/F16/BF16 value (for MLX scales/biases). |
@@ -251,7 +269,7 @@ report and write an HTML file (the atlas writes a binary file).
 `q4_0, q4_1, q5_0, q5_1, q8_0, q2_k, q3_k, q4_k (with scale_min_k4), q5_k, q6_k, iq4_nl, iq4_xs, mxfp4`.
 The formulas follow llama.cpp; tested against the `gguf` Python package.
 
-### `gguf.rs` – GGUF parser (156 lines)
+### `gguf.rs` – GGUF parser (157 lines)
 `map_file` (mmap, leaked as `'static`), `Rd::take/u32/u64/string/val` (reader), `open` (header, metadata, tensor infos, alignment), `Val::u/f/s/a/b` (metadata as number, string, array or bool).
 
 ### `tokenizer.rs` – tokenizer (518 lines)
