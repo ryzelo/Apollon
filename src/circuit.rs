@@ -1146,7 +1146,10 @@ impl<'a> Engine<'a> {
             // or when the budget is used up – what is left stays as whole blocks
             let removed = tested - stuck.len();
             let spent = self.kl() >= limit * 0.99;
-            let barren = !exhaustive && round >= 3 && tested >= 32 && (removed as f64) < 0.05 * tested as f64;
+            // (only once the blocks are small: that big halves cannot go is normal, not a sign that
+            // nothing can go any more)
+            let biggest = stuck.iter().map(|b| b.ids.len()).max().unwrap_or(0);
+            let barren = !exhaustive && round >= 3 && tested >= 32 && biggest <= 64 && (removed as f64) < 0.05 * tested as f64;
             let spent = spent && !exhaustive;
             for b in stuck {
                 if b.ids.len() == 1 {
@@ -1547,8 +1550,25 @@ impl<'a> Engine<'a> {
             }
         };
         let mut ple_in: BTreeMap<(usize, usize), Vec<u32>> = BTreeMap::new();
-        // blocks that stayed whole are expanded element by element
-        let kept: Vec<Piece> = kept.iter().flat_map(|p| p.singles()).collect();
+        // blocks of neurons / PLE dimensions that stayed whole are split further at level 3 (they have no
+        // level 3 of their own); other blocks are expanded element by element
+        let mut rest: Vec<Piece> = Vec::new();
+        for pc in kept {
+            match (level, pc) {
+                (3, Piece::Neurons { l, p, n }) if n.len() > 1 => {
+                    let cn = self.b.col_norms(*l, Site::Down);
+                    let a = site_input(&inp[*l], x_tok, Site::Down, *p, d);
+                    groups.push(Group::new(GK::Neurons { l: *l, p: *p }, n.iter().map(|&x| (x, a[x as usize].abs() * cn[x as usize])).collect()));
+                }
+                (3, Piece::PleDims { l, p, e }) if e.len() > 1 => {
+                    let cn = self.b.col_norms(*l, Site::PleProj);
+                    let gv = site_input(&inp[*l], x_tok, Site::PleProj, *p, d);
+                    groups.push(Group::new(GK::PleDims { l: *l, p: *p }, e.iter().map(|&x| (x, gv[x as usize].abs() * cn[x as usize])).collect()));
+                }
+                _ => rest.push(pc.clone()),
+            }
+        }
+        let kept: Vec<Piece> = rest.iter().flat_map(|p| p.singles()).collect();
         for pc in &kept {
             let (l, p) = pc.lp();
             let lg = &g.layers[l];
