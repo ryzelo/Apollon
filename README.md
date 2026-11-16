@@ -1,5 +1,44 @@
 # apollon
 
+**Read what LLMs think. Now.**
+
+apollon opens up a language model while it answers and shows you, for one single prediction, **which parts of
+the model produced it and how much each part contributed**. Exactly, on your own computer, with models you
+already have, and without training anything.
+
+### In plain words
+
+When a language model writes " Paris" after "The capital of France is", millions to billions of multiplications happen in
+between. Normally you only see the result. apollon computes the model itself, keeps every intermediate step, and
+answers questions like these:
+
+* **Who decided?** Which layers, attention heads and neurons pushed the model towards " Paris", and which
+  pushed against it?
+* **What if it were missing?** How does the answer change when one part is switched off?
+* **What does this neuron do?** Which inputs make it fire, and what does it write into the model?
+* **What is really needed?** What is the smallest set of computations that still produces the same answer?
+
+Every answer is **exact, not estimated**: the parts always add up to the real forward pass, and apollon checks
+this in every run. There is no second model trained on top (no sparse autoencoder, no probe classifier) that
+could be wrong in its own way. What you see is what the model computed.
+
+### Three steps
+
+1. Build apollon with Rust: `cargo build --release` (see [Install](#install)).
+2. Point it at a model you already have: an Ollama model, a Hugging Face download, or a `.gguf` file.
+3. Give it a prompt. You get a report in the terminal and an HTML report, or you click through everything in
+   the [local web workspace](#local-web-workspace) in your browser.
+
+```
+apollon -m EleutherAI/pythia-70m --decompose "The capital of France is"
+```
+
+apollon is meant for anyone who wants to look inside a language model: researchers in interpretability,
+developers who want to understand why their model answers the way it does, and curious people who want to see
+it happen.
+
+## What it does in detail
+
 **What does every part of a transformer contribute to one prediction?** apollon answers this for a single
 prompt, exactly and without training anything: no features, no labels, no surrogate model, only the matrix
 products of one forward pass. It is written in Rust without an ML framework and computes the forward pass
