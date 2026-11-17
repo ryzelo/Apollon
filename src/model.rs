@@ -341,6 +341,9 @@ pub struct RunOpts {
     pub checkpoint: bool,
     /// keep the stream at the end for all rows (tr.x_final)
     pub keep_final: bool,
+    /// skip the logits at the focus (callers that read x_final themselves, e.g. the variant passes of
+    /// --circuit): one product with the whole output matrix less
+    pub no_logits: bool,
     /// keep everything the reference tests compare (hidden_all, logits_all)
     pub dump: bool,
     /// set single neurons to a value: (layer, row, neuron, value)
@@ -642,18 +645,20 @@ fn cut_cols_in(x: &[f32], t: usize, cut: Option<&Cut>, l: usize, s: Site) -> Opt
         return None;
     }
     let nx = x.len() / t;
-    let mut v = x.to_vec();
-    for i in 0..t {
+    let mut v = vec![0f32; x.len()];
+    // row by row in parallel (the rows are independent)
+    v.par_chunks_mut(nx).zip(x.par_chunks(nx)).enumerate().for_each(|(i, (vi, xi))| {
+        vi.copy_from_slice(xi);
         if let Some(mc) = c.site(i, l, s) {
             let xbar = c.pmeans(l, i).map(|m| m.x(s));
             for &u in &mc.off {
-                v[i * nx + u as usize] = xbar.map_or(0.0, |xb| xb[u as usize]);
+                vi[u as usize] = xbar.map_or(0.0, |xb| xb[u as usize]);
             }
             for p in &mc.partial {
-                v[i * nx + p.unit as usize] = 0.0;
+                vi[p.unit as usize] = 0.0;
             }
         }
-    }
+    });
     Some(v)
 }
 
@@ -894,20 +899,30 @@ impl Model {
             }
             (q, Some((k, v)))
         } else {
-            let mut q = a.wq.as_ref().unwrap().matmul(h, t);
+            // Q, K and V are independent: all products at once (on the GPU they are in flight together)
+            let own_kv = a.kv_from.is_none();
+            let (mut q, (k_raw, v_raw)) = rayon::join(
+                || a.wq.as_ref().unwrap().matmul(h, t),
+                || {
+                    rayon::join(
+                        || own_kv.then(|| a.wk.as_ref().unwrap().matmul(h, t)),
+                        || (own_kv && !a.v_is_k).then(|| a.wv.as_ref().unwrap().matmul(h, t)),
+                    )
+                },
+            );
             cut_rows(&mut q, h, t, ad, cut, l, Site::Q, |u| u);
             add_bias(&mut q, &a.bq, ad);
             let kv = if a.kv_from.is_some() {
                 None
             } else {
                 let kd = a.n_kv * hd;
-                let mut k = a.wk.as_ref().unwrap().matmul(h, t);
+                let mut k = k_raw.unwrap();
                 cut_rows(&mut k, h, t, kd, cut, l, Site::K, |u| u);
                 add_bias(&mut k, &a.bk, kd);
                 let mut v = if a.v_is_k {
                     k.clone()
                 } else {
-                    let mut v = a.wv.as_ref().unwrap().matmul(h, t);
+                    let mut v = v_raw.unwrap();
                     cut_rows(&mut v, h, t, kd, cut, l, Site::V, |u| u);
                     add_bias(&mut v, &a.bv, kd);
                     v
@@ -1379,7 +1394,8 @@ impl Model {
             tr.focus_mlp_in.push(h2[focus * d..(focus + 1) * d].to_vec());
             let m = &b.mlp;
             let ff = m.up.rows;
-            let mut act = m.up.matmul(&h2, t);
+            // up and gate are independent: both products at once (on the GPU both are in flight together)
+            let (mut act, gate_raw) = rayon::join(|| m.up.matmul(&h2, t), || m.gate.as_ref().map(|g| g.matmul(&h2, t)));
             cut_rows(&mut act, &h2, t, ff, cut, l, Site::Up, |u| u);
             add_bias(&mut act, &m.bup, ff);
             if let Some(r) = rec.as_mut() {
@@ -1387,8 +1403,7 @@ impl Model {
                 r.up = act.clone();
             }
             let f = act_fn(m.act);
-            if let Some(g) = &m.gate {
-                let mut gg = g.matmul(&h2, t);
+            if let Some(mut gg) = gate_raw {
                 cut_rows(&mut gg, &h2, t, ff, cut, l, Site::Gate, |u| u);
                 if let Some(r) = rec.as_mut() {
                     r.gate = gg.clone();
@@ -1563,7 +1578,7 @@ impl Model {
             r.fin = (0..t).map(|i| n.scale(&x[i * d..(i + 1) * d])).collect();
         }
         tr.norms = ns;
-        if self.has_head {
+        if self.has_head && !o.no_logits {
             tr.logits = match (fz, &self.final_norm) {
                 (Some(f), Some(_)) => self.final_logits_scaled(&x[focus * d..(focus + 1) * d], f.fin[posi(focus)]),
                 _ => self.final_logits(&x[focus * d..(focus + 1) * d], 1),

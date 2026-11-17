@@ -40,13 +40,13 @@ struct Inner {
     /// page-aligned window (start, end) of a mapped file -> buffer over it (no copy); other slices
     /// (start, length) -> a copy
     regions: HashMap<(usize, usize), Buffer>,
-    x: Option<Buffer>,
-    tmp: Option<Buffer>,
-    out: Option<Buffer>,
+    /// scratch buffers not in use (inputs, unpacked rows, results); every product in flight takes its own,
+    /// so several products can run at once (from several threads) and none waits for another's results
+    pool: Vec<Buffer>,
 }
 
 // the Metal objects are reference-counted Objective-C objects, safe to share; all encoding happens
-// under the mutex
+// under the mutex, waiting for the GPU and copying the result do not
 unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
 
@@ -94,12 +94,14 @@ impl MetalBackend {
         }
     }
 
-    fn scratch(&self, slot: &mut Option<Buffer>, bytes: usize) -> Buffer {
+    /// a scratch buffer of at least `bytes` from the pool (the smallest that fits), or a new one
+    fn take(&self, inner: &mut Inner, bytes: usize) -> Buffer {
         let bytes = bytes.max(4) as u64;
-        if slot.as_ref().is_none_or(|b| b.length() < bytes) {
-            *slot = Some(self.device.new_buffer(bytes.next_power_of_two(), MTLResourceOptions::StorageModeShared));
+        let best = inner.pool.iter().enumerate().filter(|(_, b)| b.length() >= bytes).min_by_key(|(_, b)| b.length()).map(|(i, _)| i);
+        match best {
+            Some(i) => inner.pool.swap_remove(i),
+            None => self.device.new_buffer(bytes.next_power_of_two(), MTLResourceOptions::StorageModeShared),
         }
-        slot.as_ref().unwrap().clone()
     }
 
     /// C = A·Bᵀ with Apple's tuned GEMM (MPSMatrixMultiplication), encoded into `cb`
@@ -128,81 +130,98 @@ impl MetalBackend {
         }
     }
 
-    /// Unpack rows `row0..row0+nrows` into `tmp` and run the given GEMMs on it (one command buffer)
+    /// Unpack rows `row0..row0+nrows` into `tmp` and run the given GEMMs on it (one command buffer).
+    /// The mutex is held only while buffers are looked up and the work is encoded: the GPU runs and the
+    /// result is copied out without it, so other threads can encode and run their products meanwhile.
     #[allow(clippy::too_many_arguments)]
-    fn run(&self, inner: &mut Inner, m: &Mat, x: Option<&[f32]>, blocks: &[(usize, usize, Vec<(GemmP, u32, u32)>)], out_len: usize, keep_tmp: bool) -> Option<Vec<f32>> {
+    fn run(&self, m: &Mat, x: Option<&[f32]>, blocks: &[(usize, usize, Vec<(GemmP, u32, u32)>)], out_len: usize, keep_tmp: bool) -> Option<Vec<f32>> {
         let d = describe(m);
-        let (wb, wo) = self.region(inner, d.w)?;
-        let (sb, so) = match d.s {
-            Some(s) => self.region(inner, s)?,
-            None => (wb.clone(), 0),
-        };
-        let (bb, bo) = match d.b {
-            Some(s) => self.region(inner, s)?,
-            None => (wb.clone(), 0),
-        };
         let max_nb = blocks.iter().map(|b| b.1).max().unwrap_or(0);
-        let mut slot = inner.tmp.take();
-        let tmp = self.scratch(&mut slot, max_nb * m.cols * 4);
-        inner.tmp = slot;
-        let xbuf = x.map(|x| {
-            let mut slot = inner.x.take();
-            let b = self.scratch(&mut slot, x.len() * 4);
-            inner.x = slot;
-            unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), b.contents() as *mut f32, x.len()) };
-            b
-        });
-        let mut slot = inner.out.take();
-        let out = self.scratch(&mut slot, out_len * 4);
-        inner.out = slot;
-        let cb = self.queue.new_command_buffer();
         let mps = std::env::var_os("APOLLON_METAL_OWN_GEMM").is_none();
-        let mut enc = cb.new_compute_command_encoder();
-        for (row0, nb, gemms) in blocks {
-            let p = DqP { off_w: wo, off_s: so, off_b: bo, row0: *row0 as u32, nrows: *nb as u32, ..d.p };
-            enc.set_compute_pipeline_state(&self.dequant);
-            enc.set_buffer(0, Some(&wb), 0);
-            enc.set_buffer(1, Some(&sb), 0);
-            enc.set_buffer(2, Some(&bb), 0);
-            enc.set_buffer(3, Some(if keep_tmp { &out } else { &tmp }), 0);
-            enc.set_bytes(4, std::mem::size_of::<DqP>() as u64, &p as *const DqP as *const std::ffi::c_void);
-            let n = dequant_threads(&p);
-            enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
-            if let (Some(xb), true) = (&xbuf, mps) {
-                enc.end_encoding();
-                for (g, _, _) in gemms {
-                    self.mps_gemm(inner, cb, xb, &tmp, &out, g);
-                }
-                enc = cb.new_compute_command_encoder();
-            } else if let Some(xb) = &xbuf {
-                enc.set_compute_pipeline_state(&self.gemm);
-                for (g, gx, gy) in gemms {
-                    enc.set_buffer(0, Some(xb), 0);
-                    enc.set_buffer(1, Some(&tmp), 0);
-                    enc.set_buffer(2, Some(&out), 0);
-                    enc.set_bytes(3, std::mem::size_of::<GemmP>() as u64, g as *const GemmP as *const std::ffi::c_void);
-                    enc.dispatch_thread_groups(MTLSize::new(*gx as u64, *gy as u64, 1), MTLSize::new(128, 1, 1));
+        // buffers: the weights (no copy), and scratch from the pool
+        let (wb, wo, sb, so, bb, bo, tmp, xbuf, out) = {
+            let mut inner = self.inner.lock().ok()?;
+            let (wb, wo) = self.region(&mut inner, d.w)?;
+            let (sb, so) = match d.s {
+                Some(s) => self.region(&mut inner, s)?,
+                None => (wb.clone(), 0),
+            };
+            let (bb, bo) = match d.b {
+                Some(s) => self.region(&mut inner, s)?,
+                None => (wb.clone(), 0),
+            };
+            let tmp = self.take(&mut inner, max_nb * m.cols * 4);
+            let xbuf = x.map(|x| self.take(&mut inner, x.len() * 4));
+            let out = self.take(&mut inner, out_len * 4);
+            (wb, wo, sb, so, bb, bo, tmp, xbuf, out)
+        };
+        if let (Some(x), Some(b)) = (x, &xbuf) {
+            unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), b.contents() as *mut f32, x.len()) };
+        }
+        let cb = self.queue.new_command_buffer();
+        {
+            let mut inner = self.inner.lock().ok()?;
+            let mut enc = cb.new_compute_command_encoder();
+            for (row0, nb, gemms) in blocks {
+                let p = DqP { off_w: wo, off_s: so, off_b: bo, row0: *row0 as u32, nrows: *nb as u32, ..d.p };
+                enc.set_compute_pipeline_state(&self.dequant);
+                enc.set_buffer(0, Some(&wb), 0);
+                enc.set_buffer(1, Some(&sb), 0);
+                enc.set_buffer(2, Some(&bb), 0);
+                enc.set_buffer(3, Some(if keep_tmp { &out } else { &tmp }), 0);
+                enc.set_bytes(4, std::mem::size_of::<DqP>() as u64, &p as *const DqP as *const std::ffi::c_void);
+                let n = dequant_threads(&p);
+                enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+                if let (Some(xb), true) = (&xbuf, mps) {
+                    enc.end_encoding();
+                    for (g, _, _) in gemms {
+                        self.mps_gemm(&mut inner, cb, xb, &tmp, &out, g);
+                    }
+                    enc = cb.new_compute_command_encoder();
+                } else if let Some(xb) = &xbuf {
+                    enc.set_compute_pipeline_state(&self.gemm);
+                    for (g, gx, gy) in gemms {
+                        enc.set_buffer(0, Some(xb), 0);
+                        enc.set_buffer(1, Some(&tmp), 0);
+                        enc.set_buffer(2, Some(&out), 0);
+                        enc.set_bytes(3, std::mem::size_of::<GemmP>() as u64, g as *const GemmP as *const std::ffi::c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(*gx as u64, *gy as u64, 1), MTLSize::new(128, 1, 1));
+                    }
                 }
             }
+            enc.end_encoding();
         }
-        enc.end_encoding();
         let tw = std::time::Instant::now();
         cb.commit();
         cb.wait_until_completed();
         let gpu_ms = tw.elapsed().as_secs_f32() * 1e3;
-        if cb.status() != metal::MTLCommandBufferStatus::Completed {
-            return None;
-        }
+        let ok = cb.status() == metal::MTLCommandBufferStatus::Completed;
         let tc = std::time::Instant::now();
-        let mut v: Vec<f32> = Vec::with_capacity(out_len);
-        unsafe {
-            std::ptr::copy_nonoverlapping(out.contents() as *const f32, v.as_mut_ptr(), out_len);
-            v.set_len(out_len);
-        }
+        let v = ok.then(|| {
+            let mut v: Vec<f32> = Vec::with_capacity(out_len);
+            unsafe {
+                std::ptr::copy_nonoverlapping(out.contents() as *const f32, v.as_mut_ptr(), out_len);
+                v.set_len(out_len);
+            }
+            v
+        });
         if std::env::var_os("APOLLON_GPU_TIMING").is_some() {
             eprintln!("metal: {} rows × {}×{}: GPU {:.2} ms, copy out {:.2} ms", x.map_or(0, |x| x.len() / m.cols), m.rows, m.cols, gpu_ms, tc.elapsed().as_secs_f32() * 1e3);
         }
-        Some(v)
+        // the scratch buffers back into the pool
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.pool.push(tmp);
+            inner.pool.push(out);
+            if let Some(b) = xbuf {
+                inner.pool.push(b);
+            }
+            // (keep the pool bounded: a handful of products in flight at most)
+            if inner.pool.len() > 24 {
+                inner.pool.sort_by_key(|b| std::cmp::Reverse(b.length()));
+                inner.pool.truncate(24);
+            }
+        }
+        v
     }
 }
 
@@ -216,14 +235,12 @@ impl Backend for MetalBackend {
             return Some(Vec::new());
         }
         let blocks = plan(m, t, parts, r0, nr);
-        let mut inner = self.inner.lock().ok()?;
         // command buffers and encoders are autoreleased: drain them after every product
-        metal::objc::rc::autoreleasepool(|| self.run(&mut inner, m, Some(x), &blocks, t * parts * nr, false))
+        metal::objc::rc::autoreleasepool(|| self.run(m, Some(x), &blocks, t * parts * nr, false))
     }
 
     fn dequant(&self, m: &Mat, r0: usize, nr: usize) -> Option<Vec<f32>> {
         let blocks = vec![(r0, nr, Vec::new())];
-        let mut inner = self.inner.lock().ok()?;
-        metal::objc::rc::autoreleasepool(|| self.run(&mut inner, m, None, &blocks, nr * m.cols, true))
+        metal::objc::rc::autoreleasepool(|| self.run(m, None, &blocks, nr * m.cols, true))
     }
 }

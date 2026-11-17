@@ -414,6 +414,16 @@ attention, the cuts of `--circuit`, the analyses) stays on the CPU.
 * **CUDA (NVIDIA):** the driver API and NVRTC are loaded at runtime (`libcuda.so.1` / `nvcuda.dll`,
   `libnvrtc.so.*` / `nvrtc64_*.dll`); the kernels are compiled for the GPU found. Every weight tensor is copied
   to the GPU once, the first time it is used. Without a driver apollon simply runs on the CPU.
+* **Several products in flight.** The backend holds its lock only while it encodes a product; the GPU runs and
+  the result is copied back without it, every product with its own scratch buffers from a pool. So the
+  independent products of a layer go out together (Q, K and V; gate and up), and `--circuit` runs two passes
+  of an evaluation at once (`$APOLLON_PIPELINE`, default 2): while one waits for the GPU, the other does its
+  CPU work. The packing of the passes and the arithmetic of every pass are unchanged – the results are bit
+  for bit the same as one after another (checked on Pythia-14m and Gemma 3 1B: identical `--dump-circuit`
+  files). Measured on the 8 GB M3: a Gemma 3 1B search of 23,602 tests in 255 passes went from 188 s to
+  166 s (−12%), a Pythia-14m search from 25.5 s to 18.5 s. The weights are still unpacked anew for every
+  product: keeping them unpacked would take 2.8 GB of float32 for Gemma 3 1B, too much next to the model
+  on 8 GB.
 * **`--selftest-gpu`** checks the GPU against the CPU: every format with random blocks and every matrix of the
   first two layers and the output matrix of the given model – unpacked values bit for bit, products to float
   rounding – and times a product with 512 rows on both.

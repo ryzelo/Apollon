@@ -27,6 +27,7 @@ use crate::readout::{columns, softmax};
 use crate::tensor::Mat;
 use serde_json::{json, Value};
 use std::cell::RefCell;
+use std::sync::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -65,6 +66,12 @@ pub struct Opts {
 
 /// rows per variant pass (besides the clean prompt)
 const BUDGET: usize = 768;
+
+/// passes of one evaluation that run at once ($APOLLON_PIPELINE, default 2): one waits for the GPU while
+/// the other does its CPU work
+fn pipeline() -> usize {
+    std::env::var("APOLLON_PIPELINE").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n >= 1).unwrap_or(2)
+}
 /// share of ε that levels 1 … 4 may use cumulatively (the final phase may use all of it)
 const FRAC: [f32; 4] = [0.25, 0.45, 0.6, 0.85];
 /// a batched test has to stay below MARGIN·limit, the standalone rerun below the limit itself
@@ -578,8 +585,9 @@ impl State {
 
 // ====================================================================== building the cut for the forward pass
 
-type Weights = RefCell<HashMap<(usize, Site, u32), Arc<Vec<f32>>>>;
-type ColNorms = RefCell<HashMap<(usize, Site), Arc<Vec<f32>>>>;
+/// (behind a mutex: the batches of one evaluation run in parallel threads and fetch weights as they go)
+type Weights = Mutex<HashMap<(usize, Site, u32), Arc<Vec<f32>>>>;
+type ColNorms = Mutex<HashMap<(usize, Site), Arc<Vec<f32>>>>;
 /// per row of the pass, per layer
 type RowCuts = Vec<Vec<Option<Arc<LayerCut>>>>;
 
@@ -624,7 +632,7 @@ impl<'a> Builder<'a> {
             return;
         }
         let need: Vec<usize> = {
-            let w = self.w.borrow();
+            let w = self.w.lock().unwrap();
             let mut v: Vec<usize> = units.iter().filter(|&&u| !w.contains_key(&(l, s, u))).map(|&u| u as usize).collect();
             v.sort_unstable();
             v.dedup();
@@ -636,35 +644,37 @@ impl<'a> Builder<'a> {
         let (mat, _) = self.mat(l, s);
         let cols = columns(mat, &need);
         let rows = mat.rows;
-        let mut w = self.w.borrow_mut();
+        let mut w = self.w.lock().unwrap();
         for (k, &u) in need.iter().enumerate() {
             w.insert((l, s, u as u32), Arc::new(cols[k * rows..(k + 1) * rows].to_vec()));
         }
     }
     fn weights(&self, l: usize, s: Site, u: u32) -> Arc<Vec<f32>> {
-        if let Some(v) = self.w.borrow().get(&(l, s, u)) {
-            return v.clone();
+        let hit = self.w.lock().unwrap().get(&(l, s, u)).cloned();
+        if let Some(v) = hit {
+            return v;
         }
         if !s.row_wise() {
             self.prefetch(l, s, &[u]);
-            return self.w.borrow()[&(l, s, u)].clone();
+            return self.w.lock().unwrap()[&(l, s, u)].clone();
         }
         let (mat, map) = self.mat(l, s);
         let mut buf = vec![0f32; mat.cols];
         mat.row(map(u as usize), &mut buf);
         let v = Arc::new(buf);
-        self.w.borrow_mut().insert((l, s, u), v.clone());
+        self.w.lock().unwrap().insert((l, s, u), v.clone());
         v
     }
     fn col_norms(&self, l: usize, s: Site) -> Arc<Vec<f32>> {
-        if let Some(v) = self.col_norms.borrow().get(&(l, s)) {
-            return v.clone();
+        let hit = self.col_norms.lock().unwrap().get(&(l, s)).cloned();
+        if let Some(v) = hit {
+            return v;
         }
         let v = Arc::new(match s {
             Site::Down => self.m.blocks[l].mlp.col_norms().to_vec(),
             _ => self.mat(l, s).0.col_norms(),
         });
-        self.col_norms.borrow_mut().insert((l, s), v.clone());
+        self.col_norms.lock().unwrap().insert((l, s), v.clone());
         v
     }
     fn site(&self, set: &SetB, l: usize, p: usize, s: Site, g: &Geo) -> Option<Arc<MatCut>> {
@@ -929,15 +939,17 @@ impl<'a> Engine<'a> {
         Some(Arc::new(lc))
     }
 
-    /// Exact output of every candidate (each on top of the current state), many per pass
+    /// Exact output of every candidate (each on top of the current state), many per pass. The passes run in
+    /// `pipeline()` threads at once: while one waits for the GPU, another does its CPU work (attention,
+    /// norms, the cut, the readout). The packing of the batches and every pass are the same as one after
+    /// another, so the outputs are bit-identical.
     fn eval(&mut self, pieces: &[Vec<Piece>], info: &str) -> Vec<Out> {
-        let (t, d, focus) = (self.g.t, self.g.d, self.g.focus);
+        let (t, focus) = (self.g.t, self.g.focus);
         let cands: Vec<Cand> = pieces.iter().map(|p| self.cand(p)).collect();
         let mut order: Vec<usize> = (0..cands.len()).collect();
         order.sort_by_key(|&k| (std::cmp::Reverse(cands[k].l0), cands[k].p0));
-        let mut res = vec![Out::default(); cands.len()];
+        let mut batches: Vec<Vec<usize>> = Vec::new();
         let mut i = 0;
-        let t_start = Instant::now();
         while i < order.len() {
             let mut batch: Vec<usize> = Vec::new();
             let mut rows = t;
@@ -951,90 +963,136 @@ impl<'a> Engine<'a> {
                 batch.push(order[i]);
                 i += 1;
             }
-            let l0 = batch.iter().map(|&k| cands[k].l0).min().unwrap();
-            let mut pos: Vec<usize> = (0..t).collect();
-            let mut seg_start = vec![0usize; t];
-            let mut seg_row0 = vec![0usize; t];
-            let mut ids_all: Vec<u32> = self.ids.to_vec();
-            let mut cut_rows: RowCuts = self.built.clone();
-            let mut focus_rows = vec![focus];
-            for &k in &batch {
-                let c = &cands[k];
-                let r0 = pos.len();
-                for q in c.p0..=focus {
-                    pos.push(q);
-                    seg_start.push(c.p0);
-                    seg_row0.push(r0);
-                    ids_all.push(self.ids[q]);
-                    let mut layers = self.built[q].clone();
-                    for ((p, l), ops) in c.cells.range((q, 0)..(q + 1, 0)) {
-                        debug_assert_eq!(*p, q);
-                        layers[*l] = self.derive(q, *l, ops);
-                    }
-                    cut_rows.push(layers);
+            batches.push(batch);
+        }
+        let nb = batches.len();
+        let results: Vec<Mutex<Option<(Vec<Out>, f32)>>> = (0..nb).map(|_| Mutex::new(None)).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let last_print = Mutex::new(self.t0);
+        let t_start = Instant::now();
+        let (tests0, passes0, commits, kl) = (self.st.tests, self.st.passes, self.st.commits, self.kl());
+        let this: &Engine = self;
+        let work = || loop {
+            let b = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if b >= nb {
+                break;
+            }
+            let r = this.run_batch(&cands, &batches[b]);
+            *results[b].lock().unwrap() = Some(r);
+            let n = done.fetch_add(batches[b].len(), std::sync::atomic::Ordering::Relaxed) + batches[b].len();
+            if this.tty && cands.len() > batches[b].len() {
+                eprint!("\r  {info}: {n}/{} tests ({} s)        ", cands.len(), num(t_start.elapsed().as_secs_f32(), 0));
+            } else if !this.tty {
+                let mut lp = last_print.lock().unwrap();
+                if lp.elapsed().as_secs_f32() > 20.0 {
+                    *lp = Instant::now();
+                    eprintln!("  {info}: {n}/{} tests in this call · {} tests, {} passes, {} commits so far · KL {}", cands.len(), thousands(tests0 + n), thousands(passes0 + b + 1), commits, num(kl, 4));
                 }
-                focus_rows.push(r0 + (focus - c.p0));
             }
-            let n_rows = pos.len();
-            let xl = &self.base.ck.x[l0];
-            let mut x = Vec::with_capacity(n_rows * d);
-            for &q in &pos {
-                x.extend_from_slice(&xl[q * d..(q + 1) * d]);
-            }
-            let kv: Vec<Option<(Vec<f32>, Vec<f32>)>> = self
-                .base
-                .ck
-                .kv
-                .iter()
-                .enumerate()
-                .map(|(s, e)| {
-                    if s >= l0 {
-                        return None;
-                    }
-                    e.as_ref().map(|(k, v)| {
-                        let kd = k.len() / t;
-                        let mut k2 = Vec::with_capacity(n_rows * kd);
-                        let mut v2 = Vec::with_capacity(n_rows * kd);
-                        for &q in &pos {
-                            k2.extend_from_slice(&k[q * kd..(q + 1) * kd]);
-                            v2.extend_from_slice(&v[q * kd..(q + 1) * kd]);
-                        }
-                        (k2, v2)
-                    })
-                })
-                .collect();
-            let pos_rows: Vec<u32> = pos.iter().map(|&q| q as u32).collect();
-            let o = RunOpts {
-                keep_final: true,
-                start: Some(Start { layer: l0, x, kv: Arc::new(kv) }),
-                variants: Some(Arc::new(Variants { pos: pos.clone(), seg_start, seg_row0 })),
-                cut: Some(Arc::new(Cut { rows: cut_rows, means: self.means.clone(), pos: pos_rows })),
-                frozen_norms: self.fz.clone(),
-                ..Default::default()
-            };
-            let tr = self.m.run(&ids_all, focus, &o);
-            let mut xs = Vec::with_capacity(focus_rows.len() * d);
-            for &r in &focus_rows {
-                xs.extend_from_slice(&tr.x_final[r * d..(r + 1) * d]);
-            }
-            let outs = self.read(&xs);
-            self.st.clean_dev = self.st.clean_dev.max((outs[0].kl - self.base.out.kl).abs());
-            for (b, &k) in batch.iter().enumerate() {
-                res[k] = outs[b + 1];
+        };
+        let workers = pipeline().min(nb).max(1);
+        if workers == 1 {
+            work();
+        } else {
+            std::thread::scope(|sc| {
+                for _ in 0..workers {
+                    sc.spawn(work);
+                }
+            });
+        }
+        self.t0 = last_print.into_inner().unwrap();
+        let mut res = vec![Out::default(); cands.len()];
+        for (batch, r) in batches.iter().zip(results) {
+            let (outs, clean) = r.into_inner().unwrap().expect("every batch ran");
+            self.st.clean_dev = self.st.clean_dev.max(clean);
+            for (j, &k) in batch.iter().enumerate() {
+                res[k] = outs[j];
             }
             self.st.passes += 1;
             self.st.tests += batch.len();
-            if self.tty && cands.len() > batch.len() {
-                eprint!("\r  {info}: {i}/{} tests ({} s)        ", cands.len(), num(t_start.elapsed().as_secs_f32(), 0));
-            } else if !self.tty && self.t0.elapsed().as_secs_f32() > 20.0 {
-                self.t0 = Instant::now();
-                eprintln!("  {info}: {i}/{} tests in this call · {} tests, {} passes, {} commits so far · KL {}", cands.len(), thousands(self.st.tests), thousands(self.st.passes), self.st.commits, num(self.kl(), 4));
-            }
         }
         if self.tty && cands.len() > 1 {
             eprint!("\r{}\r", " ".repeat(70));
         }
         res
+    }
+
+    /// One pass: the candidates of a batch, each a copy of its positions from its earliest change to the
+    /// focus, run from the checkpoint at the batch's earliest layer. Returns their outputs and how far the
+    /// clean row of the pass is from the base run.
+    fn run_batch(&self, cands: &[Cand], batch: &[usize]) -> (Vec<Out>, f32) {
+        let (t, d, focus) = (self.g.t, self.g.d, self.g.focus);
+        let l0 = batch.iter().map(|&k| cands[k].l0).min().unwrap();
+        let mut pos: Vec<usize> = (0..t).collect();
+        let mut seg_start = vec![0usize; t];
+        let mut seg_row0 = vec![0usize; t];
+        let mut ids_all: Vec<u32> = self.ids.to_vec();
+        let mut cut_rows: RowCuts = self.built.clone();
+        let mut focus_rows = vec![focus];
+        for &k in batch {
+            let c = &cands[k];
+            let r0 = pos.len();
+            for q in c.p0..=focus {
+                pos.push(q);
+                seg_start.push(c.p0);
+                seg_row0.push(r0);
+                ids_all.push(self.ids[q]);
+                let mut layers = self.built[q].clone();
+                for ((p, l), ops) in c.cells.range((q, 0)..(q + 1, 0)) {
+                    debug_assert_eq!(*p, q);
+                    layers[*l] = self.derive(q, *l, ops);
+                }
+                cut_rows.push(layers);
+            }
+            focus_rows.push(r0 + (focus - c.p0));
+        }
+        let n_rows = pos.len();
+        let xl = &self.base.ck.x[l0];
+        let mut x = Vec::with_capacity(n_rows * d);
+        for &q in &pos {
+            x.extend_from_slice(&xl[q * d..(q + 1) * d]);
+        }
+        let kv: Vec<Option<(Vec<f32>, Vec<f32>)>> = self
+            .base
+            .ck
+            .kv
+            .iter()
+            .enumerate()
+            .map(|(s, e)| {
+                if s >= l0 {
+                    return None;
+                }
+                e.as_ref().map(|(k, v)| {
+                    let kd = k.len() / t;
+                    let mut k2 = Vec::with_capacity(n_rows * kd);
+                    let mut v2 = Vec::with_capacity(n_rows * kd);
+                    for &q in &pos {
+                        k2.extend_from_slice(&k[q * kd..(q + 1) * kd]);
+                        v2.extend_from_slice(&v[q * kd..(q + 1) * kd]);
+                    }
+                    (k2, v2)
+                })
+            })
+            .collect();
+        let pos_rows: Vec<u32> = pos.iter().map(|&q| q as u32).collect();
+        let o = RunOpts {
+            keep_final: true,
+            no_logits: true,
+            start: Some(Start { layer: l0, x, kv: Arc::new(kv) }),
+            variants: Some(Arc::new(Variants { pos: pos.clone(), seg_start, seg_row0 })),
+            cut: Some(Arc::new(Cut { rows: cut_rows, means: self.means.clone(), pos: pos_rows })),
+            frozen_norms: self.fz.clone(),
+            ..Default::default()
+        };
+        let tr = self.m.run(&ids_all, focus, &o);
+        let mut xs = Vec::with_capacity(focus_rows.len() * d);
+        for &r in &focus_rows {
+            xs.extend_from_slice(&tr.x_final[r * d..(r + 1) * d]);
+        }
+        let outs = self.read(&xs);
+        let clean = (outs[0].kl - self.base.out.kl).abs();
+        (outs[1..].to_vec(), clean)
     }
 
     /// rebuild the cut of the cells touched by `cand`
@@ -2358,7 +2416,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     let rival = order.iter().map(|&i| i as u32).find(|&i| i != y0).unwrap();
     let ys: [u32; NY] = [y0, rival];
     let full_out = read_out_fz(m, &full.x_final[focus * d..(focus + 1) * d], &ys, &p_full, plp_full, fz.as_ref().and_then(|f| f.fin.get(focus).copied()))[0];
-    let mut b = Builder { m, means: None, w: RefCell::new(HashMap::new()), col_norms: RefCell::new(HashMap::new()) };
+    let mut b = Builder { m, means: None, w: Mutex::new(HashMap::new()), col_norms: Mutex::new(HashMap::new()) };
     let refs: Vec<Vec<u32>> = if o.refs.is_empty() { vec![ids.to_vec()] } else { o.refs.clone() };
     let (means, ref_pos) = if o.mean {
         let (mn, pos) = compute_means(m, &g, &b, &refs, ids, !o.refs.is_empty());
