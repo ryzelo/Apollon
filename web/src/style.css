@@ -76,6 +76,8 @@
 .ap-label .ap-quiet { font-size: var(--fs-small); }
 .ap-kinds > button { height: 28px; font-size: var(--fs-small); border-bottom: 1px solid var(--line); }
 .ap-kinds { border-bottom: 0; }
+.ap-kinds > button:nth-child(4n) { border-right: 0; }
+.ap-kinds > button:last-child { border-right: 1px solid var(--line); }
 .ap-num { width: 80px; text-align: right; }
 .ap-options { display: flex; flex-direction: column; gap: 12px; }
 .np-disclosure.np-section { gap: 0; }
@@ -212,3 +214,17 @@ span.ap-run-x { font-size: var(--fs-cap); padding-top: 4px; }
 .ap-monolabel { font-family: var(--mono); font-size: var(--fs-small); }
 .ap-lane:disabled { cursor: default; color: var(--text-2); }
 .np-note .ap-inline { display: inline; }
+
+/* measurement tables in the panel */
+.ap-grid th, .ap-grid td { padding-right: 8px; vertical-align: top; }
+.ap-grid th:last-child, .ap-grid td:last-child { padding-right: 0; }
+.ap-grid .ap-n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ap-grid .ap-sub { display: block; font-family: var(--mono); font-size: var(--fs-cap); color: var(--text-3); white-space: nowrap; }
+.ap-grid tr.is-flip td { color: var(--text); font-weight: 600; }
+.ap-grid tr.ap-row { cursor: pointer; }
+.ap-grid tr.ap-row:hover td { color: var(--text); }
+.ap-grid tr.ap-row.is-active td { background: var(--text); color: #000; }
+.ap-bar { display: inline-block; height: 2px; margin-right: 6px; vertical-align: middle; background: var(--accent, var(--text)); }
+.np-disclosure > summary > span { font-size: var(--fs-small); color: var(--text-2); }
+.np-field > .np-select { min-width: 0; flex: 0 1 auto; max-width: 70%; }
+.ap-grid td:first-child { white-space: nowrap; }

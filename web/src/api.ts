@@ -24,6 +24,9 @@ export type Detail = Part & {
   direct_voice?: number | null;
   all_off?: Outcome;
   contrast_patches?: Outcome[] | null;
+  /** decomposition: entropy of its voice and KL of the direct read-out */
+  voice_entropy_bits?: number;
+  direct_kl?: number;
 };
 
 /** A probed component: its units are the children; the rest is what the probe measured around them. */
@@ -43,6 +46,8 @@ export type ProbeComponent = Detail & {
   flip?: { k: number; text: string; probability: number } | null;
   post_norm?: boolean;
   downstream?: ProbePath[];
+  probed_position?: number | null;
+  units_per_position?: number;
 };
 
 /** A node of a traced neuron's backward tree. */
@@ -50,10 +55,22 @@ export type TreeNode = {
   kind: string; label: string; layer?: number; unit?: number; head?: number; position?: number | null;
   activation?: number; activation_contribution?: number | null; children: TreeNode[];
 };
+/** A source of a traced neuron, as the engine names it. */
+export type Source = { kind: string; label: string; layer?: number; head?: number; unit?: number; position?: number };
+export type Scalars = { source: Source; p: number; q: number; rest_p: number; rest_q: number; top_p: { dimension: number; value: number }[]; top_q: { dimension: number; value: number }[] };
 export type TraceComponent = Detail & {
   tree?: TreeNode; source_count?: number; silent_neurons?: number;
+  p?: number; q?: number; phi?: number; gated?: boolean; activation_range?: [number, number];
   groups?: { group: string; p: number; q: number; activation_contribution: number; count: number }[];
-  removals?: { source: { label: string }; activation_contribution: number; delta_exact: number; activation_without: number; total: number | null }[];
+  removals?: {
+    source: Source; activation_contribution: number; delta_linear: number; delta_frozen_scale: number; delta_exact: number;
+    activation_without: number; total: number | null; kl?: number | null; output_without?: Prob[];
+  }[];
+  scalars?: Scalars[];
+  scalars_asked?: Scalars | null;
+  pairs?: { p_source: Source; q_source: Source; value: number }[];
+  atlas_rank?: { source: Source; rank: number | null }[];
+  read_positions?: { label: string; layer: number; head: number; pos: number; activation_contribution: number }[];
 };
 
 /** A static connection of a neuron: a source or target with its two coordinates in the (p, q) plane. */

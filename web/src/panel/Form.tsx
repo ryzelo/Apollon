@@ -10,11 +10,13 @@ const FORM_KINDS: { id: Kind; label: string; text: string }[] = [
   { id: "trace", label: "Trace", text: "Follow one neuron’s activation back to the sources that feed it." },
   { id: "circuit", label: "Circuit", text: "Search the smallest set of computation steps that still keeps the prediction, from whole blocks down to single multiplications. Every accepted step is checked by rerunning the model. This can take minutes." },
   { id: "neuron", label: "Static", text: "What one neuron reads and writes, from its weights alone. No prompt needed." },
+  { id: "atlas", label: "Atlas", text: "Store every neuron’s strongest weight connections in one file, so a trace can rank its sources against them. No prompt needed. Gemma 3 1B: about 11 s per layer and 1.1 GB with 64 entries per neuron." },
 ];
 const OPTIONS: Partial<Record<Kind, [string, string, string][]>> = {
   decompose: [["top", "Sources per component", "8"]],
   probe: [["probe-pos", "Intervention position", "Automatic"], ["probe-max", "Maximum distributed units", "1024"], ["depth", "Units to examine in detail", "6"], ["contrast", "Contrast prompt", "For example: What is 2+3?"]],
   trace: [["trace-depth", "Trace depth", "2"], ["trace-top", "Sources per node", "3"], ["scalars", "Scalar products shown", "10"], ["scalars-of", "Scalar products for source", "S14 head 1 @16"]],
+  atlas: [["atlas-k", "Entries per neuron", "64"], ["atlas-layers", "Layers, from..to (end excluded)", "All, for example 0..8"]],
   circuit: [["circuit-kl", "Allowed change of the output (KL, nats)", "0.1"], ["circuit-depth", "Finest level, 1 = blocks … 4 = single multiplications", "4"], ["circuit-tests", "Test budget", "2000000"]],
 };
 /** Choices with a fixed list of values: [option, label, [value, text][], note]. The empty value is the engine's default. */
@@ -40,7 +42,7 @@ export function Form({ draft, models, runs, online, onClose, onLaunch }: {
   const [target, setTarget] = useState(draft.target || "");
   const [options, setOptions] = useState<Record<string, string>>(draft.options || {});
   const [submitting, setSubmitting] = useState(false);
-  const staticMode = kind === "neuron";
+  const staticMode = kind === "neuron" || kind === "atlas";
   const known = models.find((m) => m.id === model);
   const send = async (request: Request) => {
     setSubmitting(true);
@@ -84,7 +86,7 @@ export function Form({ draft, models, runs, online, onClose, onLaunch }: {
       </div>
       <div className="np-section">
         <span className="np-caption">Start with</span>
-        <div className="np-seg ap-kinds">
+        <div className="np-seg np-seg--grid ap-kinds">
           {FORM_KINDS.map((k) => (
             <button type="button" key={k.id} className={kind === k.id ? "is-active" : ""} onClick={() => setKind(k.id)}>{k.label}</button>
           ))}
@@ -121,7 +123,7 @@ export function Form({ draft, models, runs, online, onClose, onLaunch }: {
                 <option value="">No atlas</option>
                 {runs.filter((r) => r.status === "completed" && r.request.kind === "atlas" && r.request.model === model).map((r) => <option key={r.id} value={r.id}>Atlas {r.id.slice(-8)}</option>)}
               </select>
-              <span className="np-note">An atlas stores each neuron’s strongest weight connections. <button type="button" className="np-link" disabled={!model.trim() || submitting} onClick={() => void send({ model, kind: "atlas", prompt: "", answer: 1, options: {} })}>Build one for this model</button></span>
+              <span className="np-note">An atlas stores each neuron’s strongest weight connections. <button type="button" className="np-link" onClick={() => setKind("atlas")}>Build one for this model</button></span>
             </label>
           )}
           {(CHOICES[kind] || []).map(([key, label, values, note]) => (
@@ -138,7 +140,7 @@ export function Form({ draft, models, runs, online, onClose, onLaunch }: {
               <span className="np-note">Separate several with “;”. Prompts in the same format, for example other additions, give the means removed steps are replaced by.</span>
             </label>
           )}
-          <label className="ap-label">Matrix products on
+          {kind !== "atlas" && <label className="ap-label">Matrix products on
               <select className="np-select" value={options.gpu || ""} onChange={(e) => setOptions((old) => ({ ...old, gpu: e.target.value }))}>
                 <option value="">Automatic (default)</option>
                 <option value="metal">GPU · Metal (Apple Silicon)</option>
@@ -146,7 +148,7 @@ export function Form({ draft, models, runs, online, onClose, onLaunch }: {
                 <option value="off">CPU only</option>
               </select>
               <span className="np-note">Automatic uses Metal on a Mac, CUDA when an NVIDIA driver is found, otherwise the CPU.</span>
-            </label>
+            </label>}
           {kind === "decompose" && (
             <label className="np-field">Intervene only at the focus position
               <input className="np-switch" type="checkbox" checked={options["focus-only"] === "true"} onChange={(e) => setOptions((old) => ({ ...old, "focus-only": String(e.target.checked) }))} />
@@ -156,7 +158,7 @@ export function Form({ draft, models, runs, online, onClose, onLaunch }: {
       </details>
       <div className="ap-actions">
         <button type="button" className="np-btn" onClick={onClose}>Cancel</button>
-        <button className="np-btn np-btn--primary" disabled={submitting || !online || !model.trim()}>{submitting ? "Starting…" : kind === "generate" ? "Generate the answer" : "Run analysis"}</button>
+        <button className="np-btn np-btn--primary" disabled={submitting || !online || !model.trim()}>{submitting ? "Starting…" : kind === "generate" ? "Generate the answer" : kind === "atlas" ? "Build the atlas" : "Run analysis"}</button>
       </div>
     </form>
   );

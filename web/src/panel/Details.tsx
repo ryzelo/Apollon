@@ -2,6 +2,7 @@
 import React, { useEffect, useState } from "react";
 import { CircuitInfo, CircuitOut, Detail, Job, NeuronStatic, Prob, Request, Result, api, artifactUrl, busy, descendants, fmt, int, neuronSpec, pct, probeSpec, runLabel, shortModel, tokenText } from "../api";
 import { Metric, Part, familyColor, familyOf, valueOf } from "../scene";
+import { NeuronHeads, ProbeMeasures, TraceMeasures } from "./Measures";
 
 export function Lane({ label, value, max, color, active, before, onClick, mono, text }: {
   label: string; value: number | null; max: number; color: string; active?: boolean; before?: number | null; onClick?: () => void; mono?: boolean;
@@ -90,6 +91,9 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
           {part.total != null && <tr><td>{circuit ? "Effect in the circuit, removed and rerun" : "Total effect, removed and rerun"}</td><td>{fmt(part.total)}</td></tr>}
           {part.total != null && part.direct != null && <tr><td>Indirect, through later layers</td><td>{fmt(part.total - part.direct)}</td></tr>}
           {part.indirect_norm != null && <tr><td>Of that, only the final norm rescaling</td><td>{fmt(part.indirect_norm)}</td></tr>}
+          {part.direct_share != null && <tr><td>Direct share of its effect</td><td>{(part.direct_share * 100).toFixed(0)}%</td></tr>}
+          {part.direct_kl != null && <tr><td>KL of its direct read-out</td><td>{part.direct_kl.toExponential(2)}</td></tr>}
+          {part.voice_entropy_bits != null && <tr><td>Entropy of its voice</td><td>{part.voice_entropy_bits.toFixed(2)} bits</td></tr>}
           {part.direct_voice != null && <tr><td>Direct contribution at the focus</td><td>{fmt(part.direct_voice)}</td></tr>}
           {part.activation_contribution != null && <tr><td>Share of the activation</td><td>{fmt(part.activation_contribution)}</td></tr>}
           {part.activation != null && <tr><td>{circuit ? "Value of the product" : "Activation"}</td><td>{fmt(part.activation)}</td></tr>}
@@ -120,6 +124,9 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
         ? <BeforeAfter real={probsOf(circuit.circuit)} without={without} label={part.label} target={result.target?.id} base="Circuit" />
         : <BeforeAfter real={result.output} without={without} label={part.label} target={result.target?.id} />)}
 
+      {result.mode === "probe" && <ProbeMeasures part={part} result={result} />}
+      {result.mode === "trace" && <TraceMeasures part={part} onSelect={onSelect} />}
+
       {(!!part.raises?.length || !!part.lowers?.length) && (
         <div className="ap-voice">
           <span className="np-caption">Tokens it moves · probability without → with</span>
@@ -144,12 +151,13 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
         <div className="ap-voice">
           <span className="np-caption">Dose · activation times a factor</span>
           <table className="np-table ap-dose">
-            <thead><tr><th>Factor</th><th>Top token</th><th>Δ log-odds</th></tr></thead>
+            <thead><tr><th>Factor</th><th>Top token</th>{result.rival && <th>Δ {tokenText(result.rival.text)}</th>}<th>Δ log-odds</th></tr></thead>
             <tbody>
               {part.dose.map((d) => (
                 <tr key={d.factor} className={d.factor === 1 ? "ap-quiet" : ""}>
                   <td>×{d.factor}</td>
                   <td>{d.top[0] ? `${tokenText(d.top[0].text)} ${pct(d.top[0].probability)}` : "—"}</td>
+                  {result.rival && <td>{fmt(d.change_rival)}</td>}
                   <td>{fmt(d.change)}</td>
                 </tr>
               ))}
@@ -163,10 +171,10 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
         <div className="ap-voice">
           <span className="np-caption">Values from the contrast prompt inserted</span>
           <table className="np-table ap-dose">
-            <thead><tr><th>Inserted</th><th>Top token</th><th>Δ log-odds</th></tr></thead>
+            <thead><tr><th>Inserted</th><th>Top token</th>{result.rival && <th>Δ {tokenText(result.rival.text)}</th>}<th>Δ log-odds</th></tr></thead>
             <tbody>
               {part.contrast_patches.map((d, i) => (
-                <tr key={i}><td>{d.label}</td><td>{d.top[0] ? `${tokenText(d.top[0].text)} ${pct(d.top[0].probability)}` : "—"}</td><td>{fmt(d.change)}</td></tr>
+                <tr key={i}><td>{d.label}</td><td>{d.top[0] ? `${tokenText(d.top[0].text)} ${pct(d.top[0].probability)}` : "—"}</td>{result.rival && <td>{fmt(d.change_rival)}</td>}<td>{fmt(d.change)}</td></tr>
               ))}
             </tbody>
           </table>
@@ -269,6 +277,7 @@ function StaticNeuron({ n }: { n: NeuronStatic }) {
       </table>
       {!!n.outputs.raises.length && <div className="ap-voice"><span className="np-caption">Tokens it raises when active</span>{top(n.outputs.raises)}</div>}
       {!!n.outputs.lowers.length && <div className="ap-voice"><span className="np-caption">Tokens it lowers when active</span>{top(n.outputs.lowers)}</div>}
+      <NeuronHeads n={n} />
       {!!n.runtime_only_head_layers.length && (
         <p className="np-note">Heads of layers {n.runtime_only_head_layers[0]} to {n.runtime_only_head_layers[n.runtime_only_head_layers.length - 1]} also write into it. What they write depends on the prompt, so they have no static connection; a trace shows them.</p>
       )}
@@ -308,6 +317,7 @@ export function Details({ job, result, neuron, runs, part, parent, metric, artif
         <p className="np-note">
           The model predicts <b className="ap-inline">{tokenText(result.target.text)}</b> after position {result.focus}
           {result.output[0] ? ` with ${pct(result.output.find((t) => t.id === result.target.id)?.probability ?? result.output[0].probability)}` : ""}.
+          {result.rival ? <> Measured against <b className="ap-inline">{tokenText(result.rival.text)}</b>{result.rival.from_contrast_prompt ? ", the prediction for the contrast prompt" : ""}.</> : ""}
           {result.components.length ? " Choose a part on the stage to see what it does and to intervene." : " Choose an answer token above the stage to decompose its prediction."}
         </p>
       )}
