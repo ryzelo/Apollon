@@ -313,6 +313,8 @@ gives, same top token), switches it off too, and so on. It stops when
 * the rest differs from the ablation baseline (every atom off) by at most 2ε – what is left has no route of
   its own, a path searched against it would only have to close a gap of ε;
 * a search ends with no atom at all – the rest comes from the baseline itself;
+* the rest does not stay finite (NaN/∞; with frozen norms a rest can grow until f32 overflows) – its top
+  token cannot be read, so the report says it is unknown whether further routes exist;
 * or after N paths (`--circuit-paths 1` = one minimal circuit, as before).
 
 Then everything is measured against the **union of all paths**: the union alone and everything except it,

@@ -2481,7 +2481,9 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     loop {
         if paths.len() >= max_paths {
             let rest = e.out_of(build_rows(&b, &off_all.complement(&g), &g), &p_full, plp_full).0;
-            stop = if rest.top[0].0 == top_ref {
+            stop = if !finite(&rest) {
+                format!("--circuit-paths {max_paths} reached; without all {} paths {}", paths.len(), overflow_txt(o))
+            } else if rest.top[0].0 == top_ref {
                 format!("--circuit-paths {max_paths} reached; without all {} paths the model still says {} ({})", paths.len(), tok(m, top_ref), pct(rest.top[0].1))
             } else {
                 format!("--circuit-paths {max_paths} reached; without all {} paths the top token is {} ({})", paths.len(), tok(m, rest.top[0].0), pct(rest.top[0].1))
@@ -2492,6 +2494,16 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
         let rest_state = off_all.complement(&g);
         let (rest, rest_logits) = e.out_of(build_rows(&b, &rest_state, &g), &p_full, plp_full);
         let signal = e.kl_to(&rest_logits, &x_base);
+        // NaN logits have no top token: a rest that overflows says nothing about further routes
+        if !finite(&rest) || !signal.is_finite() {
+            stop = format!(
+                "without the {} path{} {} – its top token cannot be read, so it is unknown whether further routes exist",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" },
+                overflow_txt(o)
+            );
+            break;
+        }
         if rest.top[0].0 != top_ref {
             stop = format!("without the {} path{} the model no longer says {}: top {} {} – every route that carries it is found", paths.len(), if paths.len() == 1 { "" } else { "s" }, tok(m, top_ref), tok(m, rest.top[0].0), pct(rest.top[0].1));
             break;
@@ -2769,7 +2781,24 @@ fn report_level(lg: &LevelLog, total: u64, st: &Style) {
     );
 }
 
+/// Whether an output could be read at all: a pass that overflows (NaN/∞) has no top token.
+fn finite(o: &Out) -> bool {
+    o.kl.is_finite() && o.top[0].1.is_finite() && o.lo.iter().all(|v| v.is_finite())
+}
+
+/// Why a rest could not be read, and what tends to keep it finite.
+fn overflow_txt(o: &Opts) -> &'static str {
+    if o.frozen {
+        "the pass overflows (NaN/∞): with frozen norms what is left can grow layer by layer until f32 overflows; --circuit-norms live or --circuit-ablation zero may stay finite"
+    } else {
+        "the pass overflows (NaN/∞)"
+    }
+}
+
 fn out_txt(m: &Model, o: &Out, ys: &[u32; NY]) -> String {
+    if !finite(o) {
+        return "not finite (NaN/∞ in the pass)".into();
+    }
     format!("top {} {} · log-odds {} {} · KL {}", tok(m, o.top[0].0), pct(o.top[0].1), tok(m, ys[0]), num(o.lo[0], 2), num(o.kl, 4))
 }
 
@@ -2839,7 +2868,7 @@ fn terminal(r: &Report, st: &Style) {
         println!("{}", st.bold(&format!("Self-expansion: {} path{}", r.paths.len(), if many { "s" } else { "" })));
         println!("  {}", st.dim("path k = the minimal circuit of what is left when the paths before it are off, measured against that rest"));
         for (i, pa) in r.paths.iter().enumerate() {
-            let without = r.fx.without_path.get(i).map_or(String::new(), |o| format!(" · union without it: {} {} (KL {})", tok(m, o.top[0].0), pct(o.top[0].1), num(o.kl, 3)));
+            let without = r.fx.without_path.get(i).map_or(String::new(), |o| if finite(o) { format!(" · union without it: {} {} (KL {})", tok(m, o.top[0].0), pct(o.top[0].1), num(o.kl, 3)) } else { " · union without it: not finite".into() });
             println!(
                 "  path {:<2} {:>9} atoms · searched against {} {} (KL to full {}, to the baseline {}) · alone: {} {} (KL {}){without} · {} s",
                 i + 1,
@@ -2977,10 +3006,10 @@ fn html(r: &Report) -> String {
         pct(r.circuit_out.top[0].1),
         num(r.circuit_out.lo[0], 2),
         num(r.circuit_out.kl, 4),
-        chip(m, r.comp_out.top[0].0),
-        pct(r.comp_out.top[0].1),
-        num(r.comp_out.lo[0], 2),
-        num(r.comp_out.kl, 3),
+        if finite(&r.comp_out) { chip(m, r.comp_out.top[0].0) } else { "not finite (NaN/∞ in the pass)".into() },
+        if finite(&r.comp_out) { pct(r.comp_out.top[0].1) } else { String::new() },
+        if finite(&r.comp_out) { num(r.comp_out.lo[0], 2) } else { "–".into() },
+        if finite(&r.comp_out) { num(r.comp_out.kl, 3) } else { "–".into() },
     );
     h += r#"<details class="info"><summary>How to read this</summary><div>
 <p>An <b>atom</b> is one scalar product at one position: W[o,c]·x<sub>c</sub> in a projection (Q, K, V, O, gate, up, down, PLE), q<sub>e</sub>·k<sub>e</sub> in a score (QKᵀ) or a<sub>j</sub>·v<sub>j</sub>[e] in the mixing (A·V). Switching an atom off means it is missing from its sum; biases, norms, softmax, activations and RoPE always run on what is left.</p>
@@ -2993,7 +3022,7 @@ fn html(r: &Report) -> String {
         h += &format!("<h2>Self-expansion: {} path{}</h2><p class=\"mu\">Path k is the minimal circuit of what is left when the paths before it are switched off, searched against that rest (KL ≤ {} and the same top token). It stops when the rest no longer gives the top token, when the rest needs no atom at all, or at --circuit-paths. Stopped: {}</p>", r.paths.len(), if many { "s" } else { "" }, num(r.o.kl, 3), esc_html(&r.stop));
         h += "<table class=\"tbl\"><tr><th>path</th><th>atoms</th><th>searched against (vs. full model)</th><th>path alone (vs. its reference)</th><th>path alone (vs. full model)</th><th>union without it</th><th>leaves</th><th>tests</th><th>s</th></tr>";
         for (i, pa) in r.paths.iter().enumerate() {
-            let o3 = |o: &Out| format!("{} {} · KL {}", chip(m, o.top[0].0), pct(o.top[0].1), num(o.kl, 3));
+            let o3 = |o: &Out| if finite(o) { format!("{} {} · KL {}", chip(m, o.top[0].0), pct(o.top[0].1), num(o.kl, 3)) } else { "not finite".to_string() };
             h += &format!(
                 "<tr><td>{}</td><td class=\"num\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
                 i + 1,

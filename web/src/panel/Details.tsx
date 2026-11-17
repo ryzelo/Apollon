@@ -274,14 +274,18 @@ function CircuitPaths({ c, target }: { c: CircuitInfo; target?: number }) {
       <table className="np-table ap-grid">
         <thead><tr><th className="ap-n">Path</th><th className="ap-n">Atoms</th><th className="ap-n">Alone</th><th className="ap-n">Union without it</th></tr></thead>
         <tbody>
-          {c.paths!.map((p) => (
+          {c.paths!.map((p) => {
+            // with one path, the union without it is everything but the circuit
+            const without = p.union_without_it ?? (c.paths!.length === 1 ? c.complement : null);
+            return (
             <tr key={p.path} title={`Searched against ${p.reference.top[0] ? tokenText(p.reference.top[0].text) : "—"}, KL ${num(p.reference.kl, 3)} to the full model and ${num(p.kl_reference_to_baseline, 3)} to everything off · ${int(p.leaves)} leaves · ${int(p.tests)} tests · ${Math.round(p.seconds)} s`}>
               <td className="ap-n">{p.path}</td>
               <td className="ap-n">{big(p.atoms)}</td>
               <td className="ap-n">{topOf(p.alone_vs_full)}<span className="ap-sub">KL {num(p.alone_vs_full.kl, 3)}</span></td>
-              <td className="ap-n">{topOf(p.union_without_it)}<span className="ap-sub">KL {num(p.union_without_it?.kl, 3)}</span></td>
+              <td className="ap-n">{without ? <>{topOf(without)}<span className="ap-sub">KL {num(without.kl, 3)}</span></> : "—"}</td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
       <p className="np-note">Path 1 is the minimal circuit of the full model. Each later path is the minimal circuit of what is left with the earlier paths switched off. KL is to the full model; a grey token is not the target. Hover a row for what it was searched against.</p>
