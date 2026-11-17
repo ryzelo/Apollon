@@ -24,6 +24,9 @@ export type Detail = Part & {
   direct_voice?: number | null;
   all_off?: Outcome;
   contrast_patches?: Outcome[] | null;
+  /** circuit leaf: the path it was found in, and the KL when it is switched off against that path alone */
+  path?: number;
+  kl_in_path?: number | null;
   /** decomposition: entropy of its voice and KL of the direct read-out */
   voice_entropy_bits?: number;
   direct_kl?: number;
@@ -102,6 +105,16 @@ export type CircuitInfo = {
   layers: { layer: number; on: Record<string, number>; total: Record<string, number>; units: string[] }[];
   cells: CircuitCell[];
   tests: number; passes: number; commits: number; refused: number; seconds: number; stopped: boolean;
+  /** self-expansion: one entry per route found, and why the search stopped */
+  paths?: CircuitPath[];
+  expansion_stop?: string;
+};
+export type CircuitPath = {
+  path: number; atoms: number; leaves: number; tests: number; seconds: number;
+  /** what it was searched against (the full model, or what the earlier paths leave), read against the full model */
+  reference: CircuitOut;
+  alone: CircuitOut; alone_vs_full: CircuitOut; union_without_it: CircuitOut | null;
+  kl_reference_to_baseline: number;
 };
 
 export type Result = {

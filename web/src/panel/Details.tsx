@@ -99,6 +99,8 @@ function Inspector({ part, parent, result, metric, busyRun, onSelect, onFollow, 
           {part.activation != null && <tr><td>{circuit ? "Value of the product" : "Activation"}</td><td>{fmt(part.activation)}</td></tr>}
           {part.kl != null && <tr><td>{circuit ? "KL to the full model without it" : "KL divergence of the output without it"}</td><td>{part.kl.toExponential(2)}</td></tr>}
           {part.count != null && <tr><td>{circuit ? "Scalar products (atoms) in it" : "Sources in this remainder"}</td><td>{int(part.count)}</td></tr>}
+          {circuit && part.path != null && (circuit.paths?.length ?? 0) > 1 && <tr><td>Found in path</td><td>{part.path}</td></tr>}
+          {circuit && part.kl_in_path != null && (circuit.paths?.length ?? 0) > 1 && <tr><td>KL without it, within its path alone</td><td>{part.kl_in_path.toExponential(2)}</td></tr>}
         </tbody>
       </table>
 
@@ -206,17 +208,18 @@ const big = (n: number) => (n >= 1e9 ? `${(n / 10 ** Math.floor(Math.log10(n))).
 /** The result of a circuit search: how much of the model is left, and what it predicts with and without the rest. */
 function CircuitSummary({ c, target }: { c: CircuitInfo; target?: number }) {
   const share = c.atoms_kept / Math.max(1, c.atoms_total);
+  const union = (c.paths?.length ?? 0) > 1;
   const rows: [string, string, CircuitOut][] = [
     ["Full model", "Every step switched on.", c.full],
-    ["Circuit only", "Only the kept steps; everything else is replaced.", c.circuit],
-    ["Everything but the circuit", "The kept steps replaced, the rest switched on.", c.complement],
+    [union ? "Union of all paths only" : "Circuit only", "Only the kept steps; everything else is replaced.", c.circuit],
+    [union ? "Everything but the paths" : "Everything but the circuit", "The kept steps replaced, the rest switched on.", c.complement],
   ];
   return (
     <section className="np-section" style={{ ["--accent" as string]: "#ff5fc8" }}>
       <span className="np-caption">Circuit</span>
       <div className="ap-inspect">
         <div>
-          <h2 className="ap-h2">{big(c.atoms_kept)} of {big(c.atoms_total)} scalar products kept</h2>
+          <h2 className="ap-h2">{big(c.atoms_kept)} of {big(c.atoms_total)} scalar products kept{union ? ` in ${c.paths!.length} paths` : ""}</h2>
           <p className="np-note">{share >= 0.001 ? `${(share * 100).toFixed(2)}%` : `${(share * 100).toExponential(1)}%`} of the forward pass, in {int(c.leaves)} leaves. Criterion: the same top token and KL to the full model at most {Number(c.criterion_kl.toPrecision(4))} nats.</p>
         </div>
         <span className="np-stat">{int(c.leaves)}</span>
@@ -241,6 +244,7 @@ function CircuitSummary({ c, target }: { c: CircuitInfo; target?: number }) {
           <tr><td>Time</td><td>{Math.round(c.seconds)} s</td></tr>
         </tbody>
       </table>
+      {!!c.paths?.length && <CircuitPaths c={c} target={target} />}
       {c.stopped && <p className="np-error">The test budget ran out. Blocks that were not resolved stay whole in the circuit.</p>}
       <div className="ap-voice">
         <span className="np-caption">Search levels</span>
@@ -255,6 +259,34 @@ function CircuitSummary({ c, target }: { c: CircuitInfo; target?: number }) {
         <p className="np-note">From whole blocks (1) through heads and neurons (2) and dimensions and keys (3) to single multiplications (4). The final step splits remaining blocks and tests every leaf alone.</p>
       </div>
     </section>
+  );
+}
+
+/** The routes the self-expansion found: each path alone, and the union without it. */
+function CircuitPaths({ c, target }: { c: CircuitInfo; target?: number }) {
+  const topOf = (o?: CircuitOut | null) => {
+    const t = o ? probsOf(o)[0] : undefined;
+    return t ? <span className={t.id === target ? "" : "ap-quiet"}>{tokenText(t.text)} {pct(t.probability)}</span> : "—";
+  };
+  return (
+    <div className="ap-voice">
+      <span className="np-caption">Routes · {c.paths!.length} path{c.paths!.length === 1 ? "" : "s"}</span>
+      <table className="np-table ap-grid">
+        <thead><tr><th className="ap-n">Path</th><th className="ap-n">Atoms</th><th className="ap-n">Alone</th><th className="ap-n">Union without it</th></tr></thead>
+        <tbody>
+          {c.paths!.map((p) => (
+            <tr key={p.path} title={`Searched against ${p.reference.top[0] ? tokenText(p.reference.top[0].text) : "—"}, KL ${num(p.reference.kl, 3)} to the full model and ${num(p.kl_reference_to_baseline, 3)} to everything off · ${int(p.leaves)} leaves · ${int(p.tests)} tests · ${Math.round(p.seconds)} s`}>
+              <td className="ap-n">{p.path}</td>
+              <td className="ap-n">{big(p.atoms)}</td>
+              <td className="ap-n">{topOf(p.alone_vs_full)}<span className="ap-sub">KL {num(p.alone_vs_full.kl, 3)}</span></td>
+              <td className="ap-n">{topOf(p.union_without_it)}<span className="ap-sub">KL {num(p.union_without_it?.kl, 3)}</span></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="np-note">Path 1 is the minimal circuit of the full model. Each later path is the minimal circuit of what is left with the earlier paths switched off. KL is to the full model; a grey token is not the target. Hover a row for what it was searched against.</p>
+      {c.expansion_stop && <p className="np-note">Stopped: {c.expansion_stop}.</p>}
+    </div>
   );
 }
 

@@ -8,7 +8,7 @@ const FORM_KINDS: { id: Kind; label: string; text: string }[] = [
   { id: "decompose", label: "Decompose", text: "Split the prediction of one answer token into the contributions of every layer." },
   { id: "probe", label: "Probe", text: "Switch the units of one component off one by one and rerun the model." },
   { id: "trace", label: "Trace", text: "Follow one neuron’s activation back to the sources that feed it." },
-  { id: "circuit", label: "Circuit", text: "Search the smallest set of computation steps that still keeps the prediction, from whole blocks down to single multiplications. Every accepted step is checked by rerunning the model. This can take minutes." },
+  { id: "circuit", label: "Circuit", text: "Search the smallest set of computation steps that still keeps the prediction, from whole blocks down to single multiplications. Every accepted step is checked by rerunning the model. Then it searches the next route in what is left, until no route carries the prediction. This can take minutes." },
   { id: "neuron", label: "Static", text: "What one neuron reads and writes, from its weights alone. No prompt needed." },
   { id: "atlas", label: "Atlas", text: "Store every neuron’s strongest weight connections in one file, so a trace can rank its sources against them. No prompt needed. Gemma 3 1B: about 11 s per layer and 1.1 GB with 64 entries per neuron." },
 ];
@@ -17,7 +17,7 @@ const OPTIONS: Partial<Record<Kind, [string, string, string][]>> = {
   probe: [["probe-pos", "Intervention position", "Automatic"], ["probe-max", "Maximum distributed units", "1024"], ["depth", "Units to examine in detail", "6"], ["contrast", "Contrast prompt", "For example: What is 2+3?"]],
   trace: [["trace-depth", "Trace depth", "2"], ["trace-top", "Sources per node", "3"], ["scalars", "Scalar products shown", "10"], ["scalars-of", "Scalar products for source", "S14 head 1 @16"]],
   atlas: [["atlas-k", "Entries per neuron", "64"], ["atlas-layers", "Layers, from..to (end excluded)", "All, for example 0..8"]],
-  circuit: [["circuit-kl", "Allowed change of the output (KL, nats)", "0.1"], ["circuit-depth", "Finest level, 1 = blocks … 4 = single multiplications", "4"], ["circuit-tests", "Test budget", "2000000"]],
+  circuit: [["circuit-kl", "Allowed change of the output (KL, nats)", "0.1"], ["circuit-depth", "Finest level, 1 = blocks … 4 = single multiplications", "4"], ["circuit-tests", "Test budget", "2000000"], ["circuit-paths", "Routes to search, 1 = one minimal circuit", "8"]],
 };
 /** Choices with a fixed list of values: [option, label, [value, text][], note]. The empty value is the engine's default. */
 const CHOICES: Partial<Record<Kind, [string, string, [string, string][], string][]>> = {
