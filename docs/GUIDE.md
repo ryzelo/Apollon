@@ -302,6 +302,66 @@ prediction breaks without each one alone, with the value of every single atom; t
 (1 = components … 4 = atoms), `--circuit-tests N` stops refining after N tests (what is unresolved then stays
 whole, and the report says so), `--dump-circuit FILE` writes the cut cell by cell and the logits as JSON.
 
+**Self-expansion: every route, not just one** (`--circuit-paths N`, default 8). A minimal circuit is one
+route that is enough on its own; the model often has more. After the first circuit (path 1) the search
+expands itself: it switches off path 1 and looks at what is left. If the rest still gives the top token, it
+searches the minimal circuit **of that rest** (path 2), measured against the rest (KL ≤ ε to what the rest
+gives, same top token), switches it off too, and so on. It stops when
+
+* the rest no longer gives the top token – every route that carries it is found; the union of the paths is
+  then enough on its own *and* needed: without it the output is gone;
+* the rest differs from the ablation baseline (every atom off) by at most 2ε – what is left has no route of
+  its own, a path searched against it would only have to close a gap of ε;
+* a search ends with no atom at all – the rest comes from the baseline itself;
+* or after N paths (`--circuit-paths 1` = one minimal circuit, as before).
+
+Then everything is measured against the **union of all paths**: the union alone and everything except it,
+the union without each path, every unit (head, K/V group, neuron, PLE dimension) and every component
+switched off alone, and every leaf switched off alone – all exact reruns, many per pass. The report lists the
+paths (what each was searched against, how far that is from the baseline, the path alone, the union without
+it) and every leaf with both effects: against its own path and against the union.
+
+**The result folder** (`--circuit-out DIR`, default `<name>_circuit/`, `none` = off) holds the circuit as data,
+from coarse to fine, so it can be opened step by step:
+
+```
+<name>_circuit/
+  README.md                                  what the files hold
+  circuit.json                               outputs, paths, every component and unit with its effect, checks
+  trace.json                                 backwards from the output: unit by unit, how many links away,
+                                             what it reads and feeds
+  layers/S07/layer.json                      one layer: components and units per position
+  layers/S07/p09/attention/head2.json        one unit with every scalar product that is on in it
+  layers/S07/p09/kv/group0.json
+  layers/S07/p09/mlp/neuron3249.json
+```
+
+Every scalar product in a unit file lists its value in the pass of the union, what it becomes when switched
+off, its path, the effect of switching its leaf off (against the path and the union), and its **sources**:
+the scalar products its value is made of, each with the exact amount it contributes – and who reads it in
+turn. With frozen norms everything between two atoms is linear in the factor that is traced, so the split
+is exact:
+
+* an atom that reads the residual stream (W[u,c]·x̂_c in Q, K, V, gate, up, PLE gate) = the sum over the
+  earlier writer atoms at the same position (W_O, W_down, W_PLE-proj into dimension c, times their post-norm,
+  the layer scalars in between and the reader's pre-norm) plus the embedding, the switched-off atoms (their
+  means), the biases and, with LayerNorm, the mean subtraction;
+* q_e·k_e = over the Q atoms of the head (k held fixed), and again over the K atoms of the key (q held
+  fixed), through the q/k norm and RoPE;
+* a_j·v_j[e] = over the V atoms (the weight held fixed); the scores of the same key are its non-linear
+  sources (softmax);
+* W_O[o,u]·z_u = over the mixing products of its head and dimension; W_down[o,n]·act_n = over the up atoms of
+  the neuron (gate held fixed), the gate atoms are its non-linear sources;
+* the output: the target's (and the rival's) logit before a softcap, over the writer atoms at the focus.
+
+Every one of these splits is checked against the value the model recorded, and so is the residual stream
+at every stage and position (embedding + atoms + switched-off atoms + biases = the stream). The largest
+relative deviation is the **trace closure** in the report and in `circuit.json`: 2·10⁻⁷ on Pythia-14m
+with zero ablation, 5·10⁻⁶ with mean ablation, ≤ 4.3·10⁻⁶ on the random Llama, Qwen3 and Gemma 3 of
+`tests/compare_circuit.py`. Per atom the 32 largest sources and readers are listed by name, the others
+summed up. Above 250,000 atoms on (a search stopped at `--circuit-depth 2`, say), only units and components
+are written, without a trace.
+
 **Example** (Gemma 3 1B, "Was ist 2+2?" → "4", mean ablation over five prompts with other numbers): of
 1.54·10¹⁰ atoms, 18,948 stay on. With only them the model still says "4" (91%); without them it says "2".
 They follow the two operands "2" through early neurons into heads of layers 14, 17 and 18 at the answer
@@ -318,8 +378,12 @@ key " Wednesday" [4], dimension 25.
 **Limits.**
 
 * One prompt, one prediction.
-* The circuit is *one* minimal set (no single leaf can go), found greedily – not necessarily the smallest. A
-  different order of tests can find a different one.
+* Every path is *one* minimal set (no single leaf can go), found greedily – not necessarily the smallest. A
+  different order of tests can find a different one. The self-expansion finds further routes in what is
+  left, but which atoms end up in path 1 and which in path 2 can depend on that order too; the union is the
+  more robust statement.
+* With redundant routes the union is large: the effect of switching off one leaf against the union is often
+  small, because another path takes over. The effect against its own path shows what the leaf does there.
 * Mean ablation depends on the reference: the circuit explains the prediction *relative to* it. With
   similar prompts (other numbers, same format) the circuit is what carries the difference – the number –
   rather than what produces the format. A first version averaged over all positions, `<bos>` excluded: on

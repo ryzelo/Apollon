@@ -14,6 +14,9 @@ Mean ablation (the default of --circuit): a switched-off product is replaced by 
 reference positions. The means are computed here from transformers alone (inputs of the Linear modules,
 q_e·k_e and a_j·v_j[e] over the visible pairs) and compared with apollon's.
 
+The search runs with the self-expansion (paths) and writes its result folder; the trace closure reported
+there (every decomposition of an atom into its sources against the recorded value) has to stay ≤ 1e-4.
+
 Cases per model:
   * random cuts over every kind of atom (--circuit-random SEED): whole sites, units, single atoms,
     keys and dimensions of QKᵀ and A·V, at every position and layer – zero and mean ablation, frozen
@@ -461,6 +464,10 @@ def search(hfs, kind, md, name, norms, abl, devs):
     J = json.load(open(dump))
     label = f"search, {norms} norms, {abl}: circuit ({J['atoms_on']} of {J['atoms_total']} atoms on)"
     devs[label] = compare(hfs, kind, J, name, devs, label)
+    # the result folder: every decomposition of the trace has to add up to the recorded value
+    F = json.load(open(os.path.join(WORK, f"circuit-{name}_circuit", "circuit.json")))
+    if F["checks"]["trace_closure"] is not None:  # (None: too many atoms to list, no trace)
+        devs[f"search, {norms} norms, {abl}: trace closure ({len(F['paths'])} path(s))"] = (F["checks"]["trace_closure"], 0.0)
     # complement: every atom of the circuit off, everything else on
     C = dict(J)
     C["logits_circuit"] = J["logits_complement"]

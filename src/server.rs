@@ -338,7 +338,7 @@ async fn execute(
         "decompose" => &["top"],
         "probe" => &["probe-pos", "probe-max", "depth", "contrast"],
         "trace" => &["trace-depth", "trace-top", "scalars", "scalars-of"],
-        "circuit" => &["circuit-kl", "circuit-depth", "circuit-tests", "circuit-ablation", "circuit-norms", "circuit-ref"],
+        "circuit" => &["circuit-kl", "circuit-depth", "circuit-tests", "circuit-ablation", "circuit-norms", "circuit-ref", "circuit-paths"],
         "atlas" => &["atlas-k", "atlas-layers"],
         _ => &[],
     };

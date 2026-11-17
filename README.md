@@ -38,7 +38,7 @@ The parts always add up to the real forward pass, and apollon checks this in eve
 | `--trace` | Takes one neuron apart at one prediction, down to single scalar products, and follows its inputs backwards through earlier neurons, heads and positions. `--trace auto` picks the most important neurons. |
 | `--neuron` | Everything one neuron *can* do, without a prompt: its strongest and weakest possible activation, the input that triggers it, and its static inputs and outputs. |
 | `--atlas` | The same for every neuron of a model, saved in one file that `--trace` can use. |
-| `--circuit` | Finds a minimal circuit for a prediction: switches off everything the answer does not need, down to single scalar products, with mean or zero ablation and optional reference prompts. |
+| `--circuit` | Finds a minimal circuit for a prediction: switches off everything the answer does not need, down to single scalar products, with mean or zero ablation and optional reference prompts. Then it expands itself: it searches the next route in what is left without the first, and so on, until the answer is gone without them. It writes a result folder you can open from coarse to fine – components, heads and neurons, then every scalar product with its value, its effect and the exact scalar products it is made of, traced back from the output. |
 | `--serve` | A local web workspace for all of the above (see below). |
 
 Every analysis checks itself in every run and reports any violation. Matrix products run on the GPU when there is

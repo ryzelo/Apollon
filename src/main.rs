@@ -99,6 +99,13 @@ Analyses:
                    that position, so switching parts off cannot inflate what is left; live = norms recompute
                    their scale (a post-norm then blows up any small rest to full size)
   --circuit-show N with --circuit: leaves listed in the terminal (default 25)
+  --circuit-paths N  with --circuit: self-expansion – after the minimal circuit, search the next one in what is
+                   left without it, and so on, until the rest no longer gives the top token (every route is
+                   found) or N paths (default 8; 1 = one minimal circuit). Every leaf, path, unit and
+                   component is then switched off alone against the union of all paths
+  --circuit-out DIR  with --circuit: the result folder (default <html name>_circuit; none = no folder):
+                   circuit.json, trace.json and layers/S…/p…/<attention|kv|mlp|ple>/<unit>.json with every
+                   scalar product that is on, its value, its effect and its exact sources
   --dump-circuit F with --circuit: write the circuit and the logits as JSON (for tests/compare_circuit.py)
   --neuron NEURON  static report without a prompt: the repertoire (all activations the neuron can reach:
                    (p, q) lies in a filled ellipse), all inputs by source kind and all outputs (later neurons,
@@ -178,6 +185,8 @@ struct Args {
     circuit_norms: Option<String>,
     circuit_ablation: Option<String>,
     circuit_ref: Vec<String>,
+    circuit_paths: Option<usize>,
+    circuit_out: Option<String>,
     gpu: Option<String>,
     selftest_gpu: bool,
 }
@@ -245,6 +254,8 @@ fn parse_args() -> Result<Args, String> {
                 }
                 a.circuit_ablation = Some(v);
             }
+            "--circuit-paths" => a.circuit_paths = Some(number(val(&x)?, "--circuit-paths")?),
+            "--circuit-out" => a.circuit_out = Some(val(&x)?),
             "--circuit-ref" => a.circuit_ref.extend(val(&x)?.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())),
             "--circuit-norms" => {
                 let v = val(&x)?;
@@ -682,6 +693,12 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
                 frozen: a.circuit_norms.as_deref() != Some("live"),
                 mean: a.circuit_ablation.as_deref() != Some("zero"),
                 refs: circuit_refs.clone(),
+                paths: a.circuit_paths.unwrap_or(8),
+                out_dir: match a.circuit_out.as_deref() {
+                    Some("none") => None,
+                    Some(d) => Some(PathBuf::from(format!("{d}{suffix}"))),
+                    None => Some(PathBuf::from(format!("{base}_circuit{suffix}"))),
+                },
             };
             circuit::run(m, seq, f, target, &o, style)?;
         }

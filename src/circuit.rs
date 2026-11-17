@@ -33,6 +33,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[path = "circuit_out.rs"]
+mod out;
+
 pub struct Opts {
     /// tolerance: KL(full ‖ circuit) in nats
     pub kl: f32,
@@ -54,6 +57,10 @@ pub struct Opts {
     pub mean: bool,
     /// reference sequences for the means (the analyzed sequence itself if empty)
     pub refs: Vec<Vec<u32>>,
+    /// self-expansion: search at most this many paths (1 = one minimal circuit, as before)
+    pub paths: usize,
+    /// the structured result folder (circuit.json, trace.json, layers/…); None = no folder
+    pub out_dir: Option<PathBuf>,
 }
 
 /// rows per variant pass (besides the clean prompt)
@@ -73,6 +80,7 @@ const LEVELS: [&str; 4] = ["components", "heads · K/V groups · neurons · PLE 
 
 // ====================================================================== geometry of the model
 
+#[derive(Clone)]
 struct LGeo {
     nh: usize,
     hd: usize,
@@ -86,6 +94,7 @@ struct LGeo {
     dp: Option<usize>,
 }
 
+#[derive(Clone)]
 struct Geo {
     d: usize,
     t: usize,
@@ -423,6 +432,59 @@ impl SetB {
         }
         units.map(|u| if self.off.contains(&(u as u32)) { 0 } else { (n - self.part.get(&(u as u32)).map_or(0, |s| s.len())) as u64 }).sum()
     }
+    /// the atoms switched off in both (the union of what is on)
+    fn intersect(&self, o: &SetB) -> SetB {
+        if self.all {
+            return o.clone();
+        }
+        if o.all {
+            return self.clone();
+        }
+        let mut r = SetB::default();
+        for &u in &self.off {
+            if o.off.contains(&u) {
+                r.off.insert(u);
+            } else if let Some(a) = o.part.get(&u) {
+                r.part.insert(u, a.clone());
+            }
+        }
+        for (&u, a) in &self.part {
+            if o.off.contains(&u) {
+                r.part.insert(u, a.clone());
+            } else if let Some(b) = o.part.get(&u) {
+                let c: BTreeSet<u32> = a.intersection(b).copied().collect();
+                if !c.is_empty() {
+                    r.part.insert(u, c);
+                }
+            }
+        }
+        r
+    }
+    /// switched off exactly where this one is on (over `units`, n atoms each); never uses `all`, so it
+    /// also serves the key sets of heads
+    fn complement(&self, units: impl Iterator<Item = u32>, n: usize) -> SetB {
+        let mut r = SetB::default();
+        if self.all {
+            return r;
+        }
+        for u in units {
+            if self.off.contains(&u) {
+                continue;
+            }
+            match self.part.get(&u) {
+                Some(a) => {
+                    let on: Vec<u32> = (0..n as u32).filter(|x| !a.contains(x)).collect();
+                    r.add_atoms(u, &on, n);
+                }
+                None => r.set_off(u),
+            }
+        }
+        r
+    }
+    /// is atom a of unit u on?
+    fn atom_on(&self, u: u32, a: u32) -> bool {
+        !self.unit_off(u) && self.part.get(&u).is_none_or(|x| !x.contains(&a))
+    }
 }
 
 #[derive(Clone, Default)]
@@ -466,6 +528,52 @@ impl CellB {
 #[derive(Clone)]
 struct State {
     cells: Vec<Vec<CellB>>, // [p][l]
+}
+
+impl State {
+    fn empty(t: usize, nl: usize) -> Self {
+        State { cells: (0..t).map(|_| (0..nl).map(|_| CellB::default()).collect()).collect() }
+    }
+    /// atoms switched off in both states: what is on is the union of both circuits
+    fn intersect(&self, o: &State, g: &Geo) -> State {
+        let mut r = State::empty(g.t, g.layers.len());
+        for p in 0..g.t {
+            for (l, lg) in g.layers.iter().enumerate() {
+                let (a, b) = (&self.cells[p][l], &o.cells[p][l]);
+                let c = &mut r.cells[p][l];
+                for s in 0..N_SITES {
+                    c.sites[s] = a.sites[s].intersect(&b.sites[s]);
+                }
+                if !a.heads.is_empty() && !b.heads.is_empty() {
+                    c.heads = (0..lg.nh).map(|h| HeadB { qk: a.heads[h].qk.intersect(&b.heads[h].qk), av: a.heads[h].av.intersect(&b.heads[h].av) }).collect();
+                }
+            }
+        }
+        r
+    }
+    /// switched off exactly where this state is on: "everything except the circuit"
+    fn complement(&self, g: &Geo) -> State {
+        let mut r = State::empty(g.t, g.layers.len());
+        for p in 0..g.t {
+            for (l, lg) in g.layers.iter().enumerate() {
+                let c = &self.cells[p][l];
+                let inv = &mut r.cells[p][l];
+                for s in ALL_SITES {
+                    if g.has(l, s) {
+                        inv.sites[s as usize] = c.sites[s as usize].complement(0..g.units(l, s) as u32, g.d);
+                    }
+                }
+                let keys = g.keys(l, p);
+                inv.heads = (0..lg.nh)
+                    .map(|h| {
+                        let hb = c.heads.get(h).cloned().unwrap_or_default();
+                        HeadB { qk: hb.qk.complement(keys.clone().map(|j| j as u32), lg.hd), av: hb.av.complement(keys.clone().map(|j| j as u32), lg.hd) }
+                    })
+                    .collect();
+            }
+        }
+        r
+    }
 }
 
 // ====================================================================== building the cut for the forward pass
@@ -655,7 +763,7 @@ struct Engine<'a> {
     m: &'a Model,
     ids: &'a [u32],
     g: Geo,
-    b: Builder<'a>,
+    b: &'a Builder<'a>,
     ys: [u32; NY],
     top_ref: u32,
     p_ref: Vec<f32>,
@@ -681,6 +789,75 @@ struct Cand {
 }
 
 impl<'a> Engine<'a> {
+    /// An engine that starts from `state` (what is switched off already) and measures every test against
+    /// `logits_ref` – or, without it, against its own start (then the start has KL 0 by construction).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        m: &'a Model, ids: &'a [u32], g: Geo, b: &'a Builder<'a>, ys: [u32; NY], top_ref: u32, logits_ref: Option<&[f32]>, state: State, max_tests: usize, fz: Option<Arc<NormScales>>,
+        means: Option<Arc<Means>>,
+    ) -> Self {
+        let built = build_rows(b, &state, &g);
+        let mut e = Engine {
+            m,
+            ids,
+            g,
+            b,
+            ys,
+            top_ref,
+            p_ref: Vec::new(),
+            ref_plp: 0.0,
+            state,
+            built,
+            base: Base { out: Out::default(), ck: Checkpoint { x: vec![], kv: vec![] }, logits: vec![] },
+            st: Stats { dead_identical: true, ..Default::default() },
+            max_tests,
+            t0: Instant::now(),
+            tty: std::io::stderr().is_terminal(),
+            fz,
+            means,
+        };
+        let own;
+        let lr = match logits_ref {
+            Some(l) => l,
+            None => {
+                own = m.run(ids, e.g.focus, &e.opts(e.built.clone())).logits;
+                &own
+            }
+        };
+        let (logz, p_ref) = softmax(lr);
+        e.ref_plp = lr.iter().map(|x| {
+            let lp = *x as f64 - logz;
+            lp.exp() * lp
+        }).sum();
+        e.p_ref = p_ref;
+        let (base, _, _) = e.run_base(false);
+        e.base = base;
+        e
+    }
+    /// read outputs against another reference distribution (e.g. the full model)
+    fn read_against(&self, xs: &[f32], p_ref: &[f32], ref_plp: f64) -> Out {
+        read_out_fz(self.m, xs, &self.ys, p_ref, ref_plp, self.fin())[0]
+    }
+    /// the output of a whole cut at the focus, against the given reference
+    fn out_of(&self, rows: RowCuts, p_ref: &[f32], ref_plp: f64) -> (Out, Vec<f32>) {
+        let tr = self.m.run(self.ids, self.g.focus, &self.opts(rows));
+        let d = self.g.d;
+        let f = self.g.focus;
+        (self.read_against(&tr.x_final[f * d..(f + 1) * d], p_ref, ref_plp), tr.logits)
+    }
+    /// the stream at the focus at the end of a pass with this cut, and the logits
+    fn focus_x(&self, rows: RowCuts) -> (Vec<f32>, Vec<f32>) {
+        let tr = self.m.run(self.ids, self.g.focus, &self.opts(rows));
+        let d = self.g.d;
+        let f = self.g.focus;
+        (tr.x_final[f * d..(f + 1) * d].to_vec(), tr.logits)
+    }
+    /// KL(reference given by its logits ‖ the output at the focus x)
+    fn kl_to(&self, ref_logits: &[f32], x: &[f32]) -> f32 {
+        let (logz, p) = softmax(ref_logits);
+        let plp: f64 = ref_logits.iter().map(|v| { let lp = *v as f64 - logz; lp.exp() * lp }).sum();
+        self.read_against(x, &p, plp).kl
+    }
     /// the scale of the final norm at the focus (frozen norms)
     fn fin(&self) -> Option<f32> {
         self.fz.as_ref().and_then(|f| f.fin.get(self.g.focus).copied())
@@ -1932,91 +2109,50 @@ struct LevelLog {
 /// A leaf of the final circuit with the effect of switching it off alone
 struct Leaf {
     piece: Piece,
+    /// switched off alone against the union of all paths (everything else as in the union)
     out: Out,
+    /// switched off alone against its own path, i.e. against the circuit its search ended with
+    in_path: Out,
+    /// the path it belongs to (1-based)
+    path: usize,
+    /// its value in the pass of the union
     value: Option<f32>,
 }
 
-pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, st: &Style) -> Result<(), String> {
-    if !m.has_head {
-        return Err("--circuit needs a model with an output head".into());
-    }
-    if focus + 1 != ids.len() {
-        return Err("--circuit analyzes the last token of the sequence".into());
-    }
-    if o.kl.is_nan() || o.kl <= 0.0 {
-        return Err("--circuit-kl must be positive".into());
-    }
-    let t_all = Instant::now();
-    let (t, d) = (ids.len(), m.d);
-    let g = Geo::new(m, t, focus);
-    let nl = g.layers.len();
-    // the full model
-    let full = m.run(ids, focus, &RunOpts { keep_final: true, record_norms: true, ..Default::default() });
-    let fz = if o.frozen { full.norms.clone().map(Arc::new) } else { None };
-    let (logz, p_ref) = softmax(&full.logits);
-    let ref_plp: f64 = full.logits.iter().map(|x| { let lp = *x as f64 - logz; lp.exp() * lp }).sum();
-    let mut order: Vec<usize> = (0..full.logits.len()).collect();
-    order.sort_by(|a, b| full.logits[*b].partial_cmp(&full.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
-    let top_ref = order[0] as u32;
-    let y0 = target.unwrap_or(top_ref);
-    let rival = order.iter().map(|&i| i as u32).find(|&i| i != y0).unwrap();
-    let ys: [u32; NY] = [y0, rival];
-    let full_out = read_out_fz(m, &full.x_final[focus * d..(focus + 1) * d], &ys, &p_ref, ref_plp, fz.as_ref().and_then(|f| f.fin.get(focus).copied()))[0];
-    let mut b = Builder { m, means: None, w: RefCell::new(HashMap::new()), col_norms: RefCell::new(HashMap::new()) };
-    let refs: Vec<Vec<u32>> = if o.refs.is_empty() { vec![ids.to_vec()] } else { o.refs.clone() };
-    let (means, ref_pos) = if o.mean {
-        let (mn, pos) = compute_means(m, &g, &b, &refs, ids, !o.refs.is_empty());
-        (Some(Arc::new(mn)), pos)
-    } else {
-        (None, Vec::new())
-    };
-    b.means = means.clone();
-    let state = State { cells: (0..t).map(|_| (0..nl).map(|_| CellB::default()).collect()).collect() };
-    let built: RowCuts = (0..t).map(|_| vec![None; nl]).collect();
-    let mut e = Engine {
-        m,
-        ids,
-        g,
-        b,
-        ys,
-        top_ref,
-        p_ref,
-        ref_plp,
-        state,
-        built,
-        base: Base { out: full_out, ck: Checkpoint { x: vec![], kv: vec![] }, logits: vec![] },
-        st: Stats { dead_identical: true, ..Default::default() },
-        max_tests: o.max_tests,
-        t0: Instant::now(),
-        tty: std::io::stderr().is_terminal(),
-        fz,
-        means,
-    };
-    let (base, _, _) = e.run_base(false);
-    // check: an empty cut changes nothing
-    let empty_identical = base.logits.iter().zip(&full.logits).all(|(a, b)| a.to_bits() == b.to_bits());
-    e.base = base;
-    let total_atoms: u64 = (0..=focus).map(|p| (0..nl).map(|l| e.g.cell_atoms(l, p)).sum::<u64>()).sum();
-    if let Some(seed) = o.random {
-        random_cut(&mut e, seed);
-        let (base, _, _) = e.run_base(false);
-        e.base = base;
-        let f = o.dump.as_ref().ok_or("--circuit-random needs --dump-circuit FILE")?;
-        let r = Report { e: &e, refs: &refs, ref_pos: &ref_pos, o, ids, focus, full_out, circuit_out: e.base.out, comp_out: e.base.out, total_atoms, logs: &[], leaves: &[], empty_identical };
-        std::fs::write(f, dump_json(&r, &full.logits)).map_err(|x| format!("{}: {x}", f.display()))?;
-        println!("random cut (seed {seed}): {} of {} atoms on, KL {} · empty cut bit-identical: {}", big(e.atoms_kept()), big(total_atoms), num(e.base.out.kl, 4), yes(empty_identical));
-        return Ok(());
-    }
-    eprintln!(
-        "circuit search: {} atoms (scalar products) at {} positions × {} layers; criterion KL ≤ {} and top token {}; norms {}; {}",
-        big(total_atoms),
-        t,
-        nl,
-        num(o.kl, 3),
-        tok(m, top_ref),
-        if o.frozen { "frozen" } else { "live" },
-        if o.mean { format!("mean ablation over {} reference positions", ref_pos.iter().map(|p| p.len()).sum::<usize>()) } else { "zero ablation".into() }
-    );
+/// One path of the self-expansion: a minimal circuit of what was left after the paths before it
+struct Path {
+    logs: Vec<LevelLog>,
+    /// KL(reference ‖ everything off): how far what it was searched against is from the ablation baseline
+    signal: f32,
+    /// the distribution it was searched against – the full model (path 1) or everything except the paths
+    /// before it – read against the full model
+    reference: Out,
+    /// the path alone (everything else off), against its reference
+    alone: Out,
+    /// the path alone, against the full model
+    alone_full: Out,
+    atoms: u64,
+    leaves: usize,
+    tests: usize,
+    passes: usize,
+    secs: f32,
+}
+
+/// What the union of the paths does as a whole and in parts (every test an exact rerun against the union)
+#[derive(Default)]
+struct UnionFx {
+    /// the union without path k (k = index + 1)
+    without_path: Vec<Out>,
+    /// every unit (head, K/V group, neuron, PLE dimension) on in the union, switched off alone
+    units: Vec<(Piece, Out)>,
+    /// every component (attention, K/V, MLP, PLE at one position) on in the union, switched off alone
+    comps: Vec<(Piece, Out)>,
+}
+
+/// The levels of one search (coarse to fine, then the final phase), starting from the engine's state.
+/// Returns the level logs and the leaves (each with its effect when switched off alone against the result).
+fn search(e: &mut Engine, o: &Opts, total_atoms: u64, st: &Style, path: usize) -> (Vec<LevelLog>, Vec<Leaf>) {
+    let (nl, focus) = (e.g.layers.len(), e.g.focus);
     // level 1: every component at every position
     let mut comps: Vec<Piece> = Vec::new();
     for l in 0..nl {
@@ -2031,6 +2167,8 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
             }
         }
     }
+    // (pieces that are off already – the paths before – cannot matter)
+    comps.retain(|pc| !e.piece_off(pc));
     let n_comps = comps.len();
     let groups = vec![Group { kind: GK::List(comps), ids: (0..n_comps as u32).collect(), proxy: vec![0.0; n_comps] }];
     let mut logs: Vec<LevelLog> = Vec::new();
@@ -2073,7 +2211,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     }
     // final phase (full ε): blocks that stayed whole are split down to single elements, then every leaf
     // alone against the final circuit; whatever can still go, goes
-    let mut leaves: Vec<Leaf>;
+    let leaves: Vec<Leaf>;
     {
         let (t0, p0, s0) = (e.st.tests, e.st.passes, Instant::now());
         let atoms0 = e.atoms_kept();
@@ -2104,29 +2242,277 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
             let cands: Vec<Vec<Piece>> = kept.iter().map(|p| vec![p.clone()]).collect();
             outs = e.eval(&cands, "minimality");
         }
-        leaves = kept.iter().cloned().zip(outs).map(|(piece, out)| Leaf { piece, out, value: None }).collect();
+        leaves = kept.iter().cloned().zip(outs).map(|(piece, out)| Leaf { piece, out, in_path: out, path, value: None }).collect();
         logs.push(LevelLog { level: 5, groups: 1, pieces_in: removed_final, kept: kept.len(), unresolved: 0, atoms: e.atoms_kept(), kl: e.kl(), tests: e.st.tests - t0, passes: e.st.passes - p0, secs: s0.elapsed().as_secs_f32() });
         report_level(logs.last().unwrap(), total_atoms, st);
     }
-    // values of the atoms (for the report): one recording pass of the circuit
-    let (_, inp, x_tok) = e.run_base(true);
+    (logs, leaves)
+}
+
+/// add the counters of one engine to another (the report shows them for all searches together)
+fn merge_stats(a: &mut Stats, b: &Stats) {
+    a.passes += b.passes;
+    a.tests += b.tests;
+    a.commits += b.commits;
+    a.refused += b.refused;
+    a.batch_dev = a.batch_dev.max(b.batch_dev);
+    a.clean_dev = a.clean_dev.max(b.clean_dev);
+    a.dead_atoms += b.dead_atoms;
+    a.dead_identical &= b.dead_identical;
+    a.stopped |= b.stopped;
+}
+
+/// The units (heads, K/V groups, neurons, PLE dimensions) and components with any atom on, as pieces
+fn alive_pieces(e: &Engine) -> (Vec<Piece>, Vec<Piece>) {
+    let g = &e.g;
+    let (mut units, mut comps) = (Vec::new(), Vec::new());
+    for p in 0..=g.focus {
+        for (l, lg) in g.layers.iter().enumerate() {
+            let k = e.cell_kept(p, l);
+            if k.iter().all(|&x| x == 0) {
+                continue;
+            }
+            let c = &e.state.cells[p][l];
+            let alive = |s: Site, u: u32| g.has(l, s) && !c.sites[s as usize].unit_off(u);
+            let keys = g.keys(l, p);
+            let mut attn = false;
+            for h in 0..lg.nh {
+                let rows = (h * lg.hd..(h + 1) * lg.hd).map(|u| u as u32);
+                let mut on = rows.clone().any(|u| alive(Site::Q, u) || alive(Site::O, u));
+                if let Some(hb) = c.heads.get(h) {
+                    on |= hb.qk.kept_in(keys.clone(), lg.hd) > 0 || hb.av.kept_in(keys.clone(), lg.hd) > 0;
+                } else {
+                    on = true;
+                }
+                if on {
+                    attn = true;
+                    units.push(Piece::Heads { l, p, h: Arc::new(vec![h as u32]) });
+                }
+            }
+            if attn {
+                comps.push(Piece::Attn { l, p });
+            }
+            if lg.own_kv {
+                let mut kv = false;
+                for gr in 0..lg.nkv {
+                    let rows = (gr * lg.hd..(gr + 1) * lg.hd).map(|u| u as u32);
+                    if rows.clone().any(|u| alive(Site::K, u) || (lg.v_site && alive(Site::V, u))) {
+                        kv = true;
+                        units.push(Piece::KvGroups { l, p, g: Arc::new(vec![gr as u32]) });
+                    }
+                }
+                if kv {
+                    comps.push(Piece::Kv { l, p });
+                }
+            }
+            let mut mlp = false;
+            for n in 0..lg.ff as u32 {
+                if alive(Site::Down, n) || alive(Site::Up, n) || (lg.gated && alive(Site::Gate, n)) {
+                    mlp = true;
+                    units.push(Piece::Neurons { l, p, n: Arc::new(vec![n]) });
+                }
+            }
+            if mlp {
+                comps.push(Piece::Mlp { l, p });
+            }
+            if let Some(dp) = lg.dp {
+                let mut ple = false;
+                for x in 0..dp as u32 {
+                    if alive(Site::PleProj, x) || alive(Site::PleGate, x) || alive(Site::PleIn, x) {
+                        ple = true;
+                        units.push(Piece::PleDims { l, p, e: Arc::new(vec![x]) });
+                    }
+                }
+                if ple {
+                    comps.push(Piece::Ple { l, p });
+                }
+            }
+        }
+    }
+    (units, comps)
+}
+
+pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, st: &Style) -> Result<(), String> {
+    if !m.has_head {
+        return Err("--circuit needs a model with an output head".into());
+    }
+    if focus + 1 != ids.len() {
+        return Err("--circuit analyzes the last token of the sequence".into());
+    }
+    if o.kl.is_nan() || o.kl <= 0.0 {
+        return Err("--circuit-kl must be positive".into());
+    }
+    let t_all = Instant::now();
+    let (t, d) = (ids.len(), m.d);
+    let g = Geo::new(m, t, focus);
+    let nl = g.layers.len();
+    // the full model
+    let full = m.run(ids, focus, &RunOpts { keep_final: true, record_norms: true, ..Default::default() });
+    let fz = if o.frozen { full.norms.clone().map(Arc::new) } else { None };
+    let (logz, p_full) = softmax(&full.logits);
+    let plp_full: f64 = full.logits.iter().map(|x| { let lp = *x as f64 - logz; lp.exp() * lp }).sum();
+    let mut order: Vec<usize> = (0..full.logits.len()).collect();
+    order.sort_by(|a, b| full.logits[*b].partial_cmp(&full.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    let top_ref = order[0] as u32;
+    let y0 = target.unwrap_or(top_ref);
+    let rival = order.iter().map(|&i| i as u32).find(|&i| i != y0).unwrap();
+    let ys: [u32; NY] = [y0, rival];
+    let full_out = read_out_fz(m, &full.x_final[focus * d..(focus + 1) * d], &ys, &p_full, plp_full, fz.as_ref().and_then(|f| f.fin.get(focus).copied()))[0];
+    let mut b = Builder { m, means: None, w: RefCell::new(HashMap::new()), col_norms: RefCell::new(HashMap::new()) };
+    let refs: Vec<Vec<u32>> = if o.refs.is_empty() { vec![ids.to_vec()] } else { o.refs.clone() };
+    let (means, ref_pos) = if o.mean {
+        let (mn, pos) = compute_means(m, &g, &b, &refs, ids, !o.refs.is_empty());
+        (Some(Arc::new(mn)), pos)
+    } else {
+        (None, Vec::new())
+    };
+    b.means = means.clone();
+    let b = b;
+    let new_engine = |state: State, reference: Option<&[f32]>| Engine::new(m, ids, g.clone(), &b, ys, top_ref, reference, state, o.max_tests, fz.clone(), means.clone());
+    let mut e = new_engine(State::empty(t, nl), Some(&full.logits));
+    // check: an empty cut changes nothing
+    let empty_identical = e.base.logits.iter().zip(&full.logits).all(|(a, b)| a.to_bits() == b.to_bits());
+    let total_atoms: u64 = (0..=focus).map(|p| (0..nl).map(|l| e.g.cell_atoms(l, p)).sum::<u64>()).sum();
+    if let Some(seed) = o.random {
+        random_cut(&mut e, seed);
+        let (base, _, _) = e.run_base(false);
+        e.base = base;
+        let f = o.dump.as_ref().ok_or("--circuit-random needs --dump-circuit FILE")?;
+        let r = Report { e: &e, refs: &refs, ref_pos: &ref_pos, o, ids, focus, full_out, circuit_out: e.base.out, comp_out: e.base.out, total_atoms, logs: &[], leaves: &[], empty_identical, paths: &[], fx: &UnionFx::default(), stop: String::new() };
+        std::fs::write(f, dump_json(&r, &full.logits)).map_err(|x| format!("{}: {x}", f.display()))?;
+        println!("random cut (seed {seed}): {} of {} atoms on, KL {} · empty cut bit-identical: {}", big(e.atoms_kept()), big(total_atoms), num(e.base.out.kl, 4), yes(empty_identical));
+        return Ok(());
+    }
+    let max_paths = o.paths.max(1);
+    eprintln!(
+        "circuit search: {} atoms (scalar products) at {} positions × {} layers; criterion KL ≤ {} and top token {}; norms {}; {}; self-expansion: up to {} path{}",
+        big(total_atoms),
+        t,
+        nl,
+        num(o.kl, 3),
+        tok(m, top_ref),
+        if o.frozen { "frozen" } else { "live" },
+        if o.mean { format!("mean ablation over {} reference positions", ref_pos.iter().map(|p| p.len()).sum::<usize>()) } else { "zero ablation".into() },
+        max_paths,
+        if max_paths == 1 { "" } else { "s" }
+    );
+    // ---------------------------------------------------------------- self-expansion: path after path
+    // Path 1 is the minimal circuit of the full model. Path k is the minimal circuit of what is left when
+    // the paths 1 … k−1 are switched off – measured against that rest, so it is the route the model still
+    // takes without them. It stops when the rest no longer gives the top token (every route is found), when
+    // the rest needs no atom at all (it comes from the ablation baseline itself), or after max_paths.
+    let mut paths: Vec<Path> = Vec::new();
+    let mut leaves: Vec<Leaf> = Vec::new();
+    let mut stats = Stats { dead_identical: true, ..Default::default() };
+    let mut off_all: State; // switched off in every path so far: what is on is the union
+    let stop: String;
+    // the ablation baseline: every atom off
+    let (x_base, _) = e.focus_x(build_rows(&b, &State::empty(t, nl).complement(&g), &g));
+    let signal_full = e.kl_to(&full.logits, &x_base);
+    {
+        if max_paths > 1 {
+            println!("{}", st.bold("path 1: the full model"));
+        }
+        let s0 = Instant::now();
+        let (logs, lv) = search(&mut e, o, total_atoms, st, 1);
+        paths.push(Path { signal: signal_full, reference: full_out, alone: e.base.out, alone_full: e.base.out, atoms: e.atoms_kept(), leaves: lv.len(), tests: e.st.tests, passes: e.st.passes, secs: s0.elapsed().as_secs_f32(), logs });
+        leaves.extend(lv);
+        merge_stats(&mut stats, &e.st);
+        off_all = e.state.clone();
+    }
+    loop {
+        if paths.len() >= max_paths {
+            let rest = e.out_of(build_rows(&b, &off_all.complement(&g), &g), &p_full, plp_full).0;
+            stop = if rest.top[0].0 == top_ref {
+                format!("--circuit-paths {max_paths} reached; without all {} paths the model still says {} ({})", paths.len(), tok(m, top_ref), pct(rest.top[0].1))
+            } else {
+                format!("--circuit-paths {max_paths} reached; without all {} paths the top token is {} ({})", paths.len(), tok(m, rest.top[0].0), pct(rest.top[0].1))
+            };
+            break;
+        }
+        let k = paths.len() + 1;
+        let rest_state = off_all.complement(&g);
+        let (rest, rest_logits) = e.out_of(build_rows(&b, &rest_state, &g), &p_full, plp_full);
+        let signal = e.kl_to(&rest_logits, &x_base);
+        if rest.top[0].0 != top_ref {
+            stop = format!("without the {} path{} the model no longer says {}: top {} {} – every route that carries it is found", paths.len(), if paths.len() == 1 { "" } else { "s" }, tok(m, top_ref), tok(m, rest.top[0].0), pct(rest.top[0].1));
+            break;
+        }
+        // a rest this close to the baseline carries no route of its own: a path searched against it would
+        // only have to close a gap of at most ε
+        if signal <= 2.0 * o.kl {
+            stop = format!(
+                "without the {} path{} the model still says {} ({}), but what is left differs from the ablation baseline (every atom off) by only KL {} ≤ 2ε: no route of its own is left",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" },
+                tok(m, top_ref),
+                pct(rest.top[0].1),
+                num(signal, 4)
+            );
+            break;
+        }
+        println!();
+        println!("{}", st.bold(&format!("path {k}: what is left without path{} 1–{}: top {} {} · KL to the full model {} · KL to the baseline {}", if k > 2 { "s" } else { "" }, k - 1, tok(m, rest.top[0].0), pct(rest.top[0].1), num(rest.kl, 4), num(signal, 4))));
+        let s0 = Instant::now();
+        let mut ek = new_engine(rest_state, None);
+        let atoms_start = ek.atoms_kept();
+        let (logs, lv) = search(&mut ek, o, total_atoms, st, k);
+        merge_stats(&mut stats, &ek.st);
+        let atoms = ek.atoms_kept();
+        if atoms == 0 || lv.is_empty() {
+            stop = format!("what is left without the {} path{} needs no atom at all ({} of them were on): it comes from the ablation baseline itself", paths.len(), if paths.len() == 1 { "" } else { "s" }, big(atoms_start));
+            break;
+        }
+        let alone_full = ek.out_of(ek.built.clone(), &p_full, plp_full).0;
+        paths.push(Path { signal, reference: rest, alone: ek.base.out, alone_full, atoms, leaves: lv.len(), tests: ek.st.tests, passes: ek.st.passes, secs: s0.elapsed().as_secs_f32(), logs });
+        leaves.extend(lv);
+        off_all = off_all.intersect(&ek.state, &g);
+    }
+    // ---------------------------------------------------------------- the union of all paths
+    let mut eu = if paths.len() == 1 { e } else { new_engine(off_all, Some(&full.logits)) };
+    let circuit_out = eu.base.out;
+    let comp_out = eu.out_of(complement(&eu), &p_full, plp_full).0;
+    let mut fx = UnionFx::default();
+    if paths.len() > 1 {
+        // every leaf alone, every path, every unit and component – all against the union
+        let cands: Vec<Vec<Piece>> = leaves.iter().map(|lf| vec![lf.piece.clone()]).collect();
+        let outs = eu.eval(&cands, "union: every leaf alone");
+        for (lf, o2) in leaves.iter_mut().zip(outs) {
+            lf.out = o2;
+        }
+        let per_path: Vec<Vec<Piece>> = (1..=paths.len()).map(|k| leaves.iter().filter(|lf| lf.path == k).map(|lf| lf.piece.clone()).collect()).collect();
+        fx.without_path = eu.eval(&per_path, "union: every path off");
+    }
+    let (units, comps) = alive_pieces(&eu);
+    let cands: Vec<Vec<Piece>> = units.iter().chain(&comps).map(|pc| vec![pc.clone()]).collect();
+    let outs = eu.eval(&cands, "union: every unit and component alone");
+    let nu = units.len();
+    fx.units = units.into_iter().zip(outs[..nu].iter().copied()).collect();
+    fx.comps = comps.into_iter().zip(outs[nu..].iter().copied()).collect();
+    if paths.len() > 1 {
+        merge_stats(&mut stats, &eu.st);
+        eu.st = stats;
+    }
+    // values of the atoms in the pass of the union
+    let (_, inp, x_tok) = eu.run_base(true);
     for lf in leaves.iter_mut() {
-        lf.value = atom_value(&e, &lf.piece, &inp, &x_tok);
+        lf.value = atom_value(&eu, &lf.piece, &inp, &x_tok);
     }
     drop(inp);
-    leaves.sort_by(|a, b| b.out.kl.partial_cmp(&a.out.kl).unwrap_or(std::cmp::Ordering::Equal));
-    // verification: the circuit alone, and everything except the circuit
-    let circuit_out = e.base.out;
-    let comp = complement(&e);
-    let comp_out = {
-        let tr = m.run(ids, focus, &e.opts(comp));
-        e.read(&tr.x_final[focus * d..(focus + 1) * d])[0]
-    };
-    e.st.secs = t_all.elapsed().as_secs_f32();
-    let r = Report { e: &e, refs: &refs, ref_pos: &ref_pos, o, ids, focus, full_out, circuit_out, comp_out, total_atoms, logs: &logs, leaves: &leaves, empty_identical };
+    leaves.sort_by(|a, b| b.in_path.kl.partial_cmp(&a.in_path.kl).unwrap_or(std::cmp::Ordering::Equal));
+    eu.st.secs = t_all.elapsed().as_secs_f32();
+    let r = Report { e: &eu, refs: &refs, ref_pos: &ref_pos, o, ids, focus, full_out, circuit_out, comp_out, total_atoms, logs: &paths[0].logs, leaves: &leaves, empty_identical, paths: &paths, fx: &fx, stop };
     terminal(&r, st);
     std::fs::write(&o.html, html(&r)).map_err(|x| format!("{}: {x}", o.html.display()))?;
     println!("{}", st.dim(&format!("HTML: {}", o.html.display())));
+    if let Some(dir) = &o.out_dir {
+        let closure = out::write(&r, dir, &p_full, plp_full)?;
+        let what = match closure {
+            Some(c) => format!("trace closure: largest relative deviation {}", sci(c)),
+            None => "too many atoms on to list them: units and components only".into(),
+        };
+        println!("{}", st.dim(&format!("result folder: {} ({what})", dir.display())));
+    }
     if let Some(f) = &o.dump {
         std::fs::write(f, dump_json(&r, &full.logits)).map_err(|x| format!("{}: {x}", f.display()))?;
         println!("{}", st.dim(&format!("JSON: {}", f.display())));
@@ -2238,59 +2624,26 @@ fn atom_value(e: &Engine, pc: &Piece, inp: &[LayerInputs], x_tok: &[f32]) -> Opt
 
 /// The cut that switches off exactly the atoms of the circuit and leaves everything else on
 fn complement(e: &Engine) -> RowCuts {
-    let g = &e.g;
-    let mut rows: RowCuts = Vec::new();
-    for p in 0..g.t {
-        let mut layers = Vec::new();
-        for (l, lg) in g.layers.iter().enumerate() {
-            let c = &e.state.cells[p][l];
-            let mut inv = CellB { heads: vec![HeadB::default(); lg.nh], ..Default::default() };
-            for s in ALL_SITES {
-                if !g.has(l, s) {
-                    continue;
-                }
-                let sb = &c.sites[s as usize];
-                if sb.all {
-                    continue;
-                }
-                let iv = &mut inv.sites[s as usize];
-                for u in 0..g.units(l, s) as u32 {
-                    if sb.off.contains(&u) {
-                        continue;
-                    }
-                    match sb.part.get(&u) {
-                        Some(a) => {
-                            let on: Vec<u32> = (0..g.d as u32).filter(|x| !a.contains(x)).collect();
-                            iv.add_atoms(u, &on, g.d);
-                        }
-                        None => iv.set_off(u),
-                    }
+    build_rows(e.b, &e.state.complement(&e.g), &e.g)
+}
+
+/// the cut of every cell of a state (the columns of partially cut column-wise units fetched per matrix in
+/// one pass)
+fn build_rows(b: &Builder, st: &State, g: &Geo) -> RowCuts {
+    let mut need: BTreeMap<(usize, Site), Vec<u32>> = BTreeMap::new();
+    for row in &st.cells {
+        for (l, c) in row.iter().enumerate() {
+            for s in [Site::O, Site::Down, Site::PleProj] {
+                if !c.sites[s as usize].part.is_empty() {
+                    need.entry((l, s)).or_default().extend(c.sites[s as usize].part.keys());
                 }
             }
-            let keys = g.keys(l, p);
-            for h in 0..lg.nh {
-                let hb = c.heads.get(h).cloned().unwrap_or_default();
-                let HeadB { qk, av } = &mut inv.heads[h];
-                for (src, dst) in [(&hb.qk, qk), (&hb.av, av)] {
-                    for j in keys.clone().map(|j| j as u32) {
-                        if src.off.contains(&j) {
-                            continue;
-                        }
-                        match src.part.get(&j) {
-                            Some(a) => {
-                                let on: Vec<u32> = (0..lg.hd as u32).filter(|x| !a.contains(x)).collect();
-                                dst.add_atoms(j, &on, lg.hd);
-                            }
-                            None => dst.set_off(j),
-                        }
-                    }
-                }
-            }
-            layers.push(e.b.cell(&inv, l, p, g));
         }
-        rows.push(layers);
     }
-    rows
+    for ((l, s), us) in need {
+        b.prefetch(l, s, &us);
+    }
+    (0..g.t).map(|p| (0..g.layers.len()).map(|l| b.cell(&st.cells[p][l], l, p, g)).collect()).collect()
 }
 
 // ====================================================================== report
@@ -2309,6 +2662,11 @@ struct Report<'a, 'b> {
     logs: &'a [LevelLog],
     leaves: &'a [Leaf],
     empty_identical: bool,
+    /// the paths of the self-expansion (empty in test mode)
+    paths: &'a [Path],
+    fx: &'a UnionFx,
+    /// why the self-expansion stopped
+    stop: String,
 }
 
 /// 1234567 -> "1,234,567"; beyond 10⁹ as "1.2·10⁹"
@@ -2408,15 +2766,38 @@ fn terminal(r: &Report, st: &Style) {
     let m = e.m;
     let ys = &e.ys;
     let kept = e.atoms_kept();
+    let many = r.paths.len() > 1;
     println!();
     println!("{}", st.bold(&format!("Circuit for {} at token [{}]", tok(m, e.top_ref), r.focus)));
     println!("  criterion: KL(full ‖ circuit) ≤ {} nats and the same top token", num(r.o.kl, 3));
     println!("  {}", norms_txt(r.o.frozen));
     println!("  {}", ablation_txt(r));
-    println!("  {} of {} atoms stay on ({}) · {} leaves", st.bold(&big(kept)), big(r.total_atoms), share(kept, r.total_atoms), thousands(r.leaves.len()));
+    println!("  {} of {} atoms stay on ({}) · {} leaves{}", st.bold(&big(kept)), big(r.total_atoms), share(kept, r.total_atoms), thousands(r.leaves.len()), if many { format!(" in {} paths", r.paths.len()) } else { String::new() });
     println!("  full model:            {}", out_txt(m, &r.full_out, ys));
-    println!("  circuit only:          {}", out_txt(m, &r.circuit_out, ys));
+    println!("  {}{}", if many { "all paths together:    " } else { "circuit only:          " }, out_txt(m, &r.circuit_out, ys));
     println!("  everything but it:     {}", out_txt(m, &r.comp_out, ys));
+    if !r.paths.is_empty() {
+        println!();
+        println!("{}", st.bold(&format!("Self-expansion: {} path{}", r.paths.len(), if many { "s" } else { "" })));
+        println!("  {}", st.dim("path k = the minimal circuit of what is left when the paths before it are off, measured against that rest"));
+        for (i, pa) in r.paths.iter().enumerate() {
+            let without = r.fx.without_path.get(i).map_or(String::new(), |o| format!(" · union without it: {} {} (KL {})", tok(m, o.top[0].0), pct(o.top[0].1), num(o.kl, 3)));
+            println!(
+                "  path {:<2} {:>9} atoms · searched against {} {} (KL to full {}, to the baseline {}) · alone: {} {} (KL {}){without} · {} s",
+                i + 1,
+                big(pa.atoms),
+                tok(m, pa.reference.top[0].0),
+                pct(pa.reference.top[0].1),
+                num(pa.reference.kl, 3),
+                num(pa.signal, 3),
+                tok(m, pa.alone.top[0].0),
+                pct(pa.alone.top[0].1),
+                num(pa.alone.kl, 3),
+                num(pa.secs, 0)
+            );
+        }
+        println!("  {}", st.dim(&format!("stopped: {}", r.stop)));
+    }
     println!();
     println!("{}", st.bold("Atoms on per layer (attention = Q, O, QKᵀ, A·V · K/V · MLP = gate, up, down · PLE)"));
     for (l, on, tot, units) in layer_rows(e) {
@@ -2428,11 +2809,22 @@ fn terminal(r: &Report, st: &Style) {
         let u = if units.len() > 8 { format!("{} … (+{})", units[..8].join(", "), units.len() - 8) } else { units.join(", ") };
         println!("  S{l:<3} {:<44} {}", cols.join(" · "), st.dim(&u));
     }
+    if !r.fx.units.is_empty() {
+        let mut us: Vec<&(Piece, Out)> = r.fx.units.iter().collect();
+        us.sort_by(|a, b| b.1.kl.partial_cmp(&a.1.kl).unwrap_or(std::cmp::Ordering::Equal));
+        println!();
+        println!("{}", st.bold(&format!("Units, most necessary first ({} heads, K/V groups, neurons, PLE dimensions; each switched off alone against the {})", r.fx.units.len(), if many { "union" } else { "circuit" })));
+        for (pc, o2) in us.iter().take(r.o.show.min(15)) {
+            println!("  {:<28} → {} {} · KL {}", pc.name(m), tok(m, o2.top[0].0), pct(o2.top[0].1), num(o2.kl, 3));
+        }
+    }
     println!();
-    println!("{}", st.bold(&format!("The {} most necessary leaves (each switched off alone, everything else as in the circuit)", r.o.show.min(r.leaves.len()))));
+    println!("{}", st.bold(&format!("The {} most necessary leaves (each switched off alone against its own path{})", r.o.show.min(r.leaves.len()), if many { "; then against the union" } else { "" })));
     for lf in r.leaves.iter().take(r.o.show) {
         let v = lf.value.map_or(String::new(), |v| format!(" = {}", num(v, 4)));
-        println!("  {:<58} → {} {} · KL {}", format!("{}{v}", lf.piece.name(m)), tok(m, lf.out.top[0].0), pct(lf.out.top[0].1), num(lf.out.kl, 3));
+        let pth = if many { format!("[{}] ", lf.path) } else { String::new() };
+        let un = if many { format!(" | union: {} {} · KL {}", tok(m, lf.out.top[0].0), pct(lf.out.top[0].1), num(lf.out.kl, 3)) } else { String::new() };
+        println!("  {pth}{:<58} → {} {} · KL {}{un}", format!("{}{v}", lf.piece.name(m)), tok(m, lf.in_path.top[0].0), pct(lf.in_path.top[0].1), num(lf.in_path.kl, 3));
     }
     println!();
     let s = &e.st;
@@ -2504,7 +2896,7 @@ fn html(r: &Report) -> String {
 <p><b>{}</b> of {} atoms stay on ({}), {} leaves.</p>
 <table class="tbl"><tr><th></th><th>top</th><th>log-odds {}</th><th>KL</th></tr>
 <tr><td>full model</td><td>{} {}</td><td class="num">{}</td><td class="num">0</td></tr>
-<tr><td>circuit only</td><td>{} {}</td><td class="num">{}</td><td class="num">{}</td></tr>
+<tr><td>circuit (all paths)</td><td>{} {}</td><td class="num">{}</td><td class="num">{}</td></tr>
 <tr><td>everything except the circuit</td><td>{} {}</td><td class="num">{}</td><td class="num">{}</td></tr></table>
 "#,
         esc_html(&m.name),
@@ -2538,6 +2930,36 @@ fn html(r: &Report) -> String {
 <p><b>Everything except the circuit</b> switches off exactly the atoms that the circuit keeps and leaves all others on.</p>
 </div></details>
 "#;
+    if !r.paths.is_empty() {
+        let many = r.paths.len() > 1;
+        h += &format!("<h2>Self-expansion: {} path{}</h2><p class=\"mu\">Path k is the minimal circuit of what is left when the paths before it are switched off, searched against that rest (KL ≤ {} and the same top token). It stops when the rest no longer gives the top token, when the rest needs no atom at all, or at --circuit-paths. Stopped: {}</p>", r.paths.len(), if many { "s" } else { "" }, num(r.o.kl, 3), esc_html(&r.stop));
+        h += "<table class=\"tbl\"><tr><th>path</th><th>atoms</th><th>searched against (vs. full model)</th><th>path alone (vs. its reference)</th><th>path alone (vs. full model)</th><th>union without it</th><th>leaves</th><th>tests</th><th>s</th></tr>";
+        for (i, pa) in r.paths.iter().enumerate() {
+            let o3 = |o: &Out| format!("{} {} · KL {}", chip(m, o.top[0].0), pct(o.top[0].1), num(o.kl, 3));
+            h += &format!(
+                "<tr><td>{}</td><td class=\"num\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                i + 1,
+                big(pa.atoms),
+                o3(&pa.reference),
+                o3(&pa.alone),
+                o3(&pa.alone_full),
+                r.fx.without_path.get(i).map_or("–".to_string(), o3),
+                thousands(pa.leaves),
+                thousands(pa.tests),
+                num(pa.secs, 0)
+            );
+        }
+        h += "</table>";
+    }
+    if !r.fx.units.is_empty() {
+        let mut us: Vec<&(Piece, Out)> = r.fx.units.iter().chain(&r.fx.comps).collect();
+        us.sort_by(|a, b| b.1.kl.partial_cmp(&a.1.kl).unwrap_or(std::cmp::Ordering::Equal));
+        h += &format!("<h2>Components and units</h2><p class=\"mu\">Every component (attention, K/V, MLP, PLE at one position) and every unit (head, K/V group, neuron, PLE dimension) with an atom on, switched off alone against the {}.</p><table class=\"tbl leaf\"><tr><th>part</th><th>top without it</th><th>log-odds {}</th><th>KL</th></tr>", if r.paths.len() > 1 { "union of all paths" } else { "circuit" }, chip(m, ys[0]));
+        for (pc, o2) in us {
+            h += &format!("<tr><td><code>{}</code></td><td>{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>", esc_html(&pc.name(m)), chip(m, o2.top[0].0), pct(o2.top[0].1), num(o2.lo[0], 2), num(o2.kl, 4));
+        }
+        h += "</table>";
+    }
     h += "<h2>Levels</h2><table class=\"tbl lvl\"><tr><th>level</th><th>pieces</th><th>kept</th><th>atoms on</th><th>KL</th><th>tests</th><th>passes</th><th>s</th></tr>";
     for lg in r.logs {
         h += &format!(
@@ -2588,15 +3010,19 @@ fn html(r: &Report) -> String {
     }
     h += "</table>";
     // leaves
-    h += &format!("<h2>All {} leaves, most necessary first</h2><p class=\"mu\">Each leaf switched off alone, everything else as in the circuit.</p><table class=\"tbl leaf\"><tr><th>leaf</th><th>value</th><th>top without it</th><th>log-odds {}</th><th>KL</th></tr>", thousands(r.leaves.len()), chip(m, ys[0]));
+    h += &format!("<h2>All {} leaves, most necessary first</h2><p class=\"mu\">Each leaf switched off alone against its own path (the circuit its search ended with), and against the union of all paths.</p><table class=\"tbl leaf\"><tr><th>path</th><th>leaf</th><th>value</th><th>top without it (path)</th><th>log-odds {}</th><th>KL</th><th>top without it (union)</th><th>KL</th></tr>", thousands(r.leaves.len()), chip(m, ys[0]));
     for lf in r.leaves {
         h += &format!(
-            "<tr><td><code>{}</code></td><td class=\"num\">{}</td><td>{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            "<tr><td class=\"num\">{}</td><td><code>{}</code></td><td class=\"num\">{}</td><td>{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{} {}</td><td class=\"num\">{}</td></tr>",
+            lf.path,
             esc_html(&lf.piece.name(m)),
             lf.value.map_or(String::new(), |v| num(v, 4)),
+            chip(m, lf.in_path.top[0].0),
+            pct(lf.in_path.top[0].1),
+            num(lf.in_path.lo[0], 2),
+            num(lf.in_path.kl, 4),
             chip(m, lf.out.top[0].0),
             pct(lf.out.top[0].1),
-            num(lf.out.lo[0], 2),
             num(lf.out.kl, 4)
         );
     }
@@ -2677,7 +3103,7 @@ fn result_json(r: &Report, full_logits: &[f32]) -> Value {
         let without: Vec<Value> = lf.out.top.iter().map(|&(id, pr)| json!({"id": id, "text": m.tok.piece(id), "probability": pr})).collect();
         groups.entry((l, order(family))).or_default().push(json!({
             "id": format!("leaf-{i}"), "label": lf.piece.name(m), "layer": l, "kind": kind, "unit": unit,
-            "position": p, "direct": null, "total": base - lf.out.lo[0], "kl": lf.out.kl,
+            "position": p, "direct": null, "total": base - lf.out.lo[0], "kl": lf.out.kl, "path": lf.path, "kl_in_path": lf.in_path.kl,
             "count": lf.piece.n_atoms(&e.g), "activation": lf.value, "output_without": without,
         }));
     }
@@ -2737,6 +3163,10 @@ fn result_json(r: &Report, full_logits: &[f32]) -> Value {
         "full": out(&r.full_out), "circuit": out(&r.circuit_out), "complement": out(&r.comp_out),
         "levels": levels, "layers": layers, "cells": cells,
         "tests": s.tests, "passes": s.passes, "commits": s.commits, "refused": s.refused, "seconds": s.secs, "stopped": s.stopped,
+        "paths": r.paths.iter().enumerate().map(|(i, pa)| json!({"path": i + 1, "atoms": pa.atoms, "leaves": pa.leaves,
+            "reference": out(&pa.reference), "alone": out(&pa.alone), "alone_vs_full": out(&pa.alone_full),
+            "union_without_it": r.fx.without_path.get(i).map(out), "kl_reference_to_baseline": pa.signal, "tests": pa.tests, "seconds": pa.secs})).collect::<Vec<_>>(),
+        "expansion_stop": r.stop,
     });
     result["checks"] = json!([
         {"label": "Empty cut = normal pass (bit-identical)", "deviation": if r.empty_identical { 0.0 } else { 1.0 }, "passed": r.empty_identical},
@@ -2800,4 +3230,49 @@ fn dump_json(r: &Report, full_logits: &[f32]) -> String {
         "atoms_total": r.total_atoms,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(all: bool, off: &[u32], part: &[(u32, &[u32])]) -> SetB {
+        SetB { all, off: off.iter().copied().collect(), part: part.iter().map(|(u, a)| (*u, a.iter().copied().collect())).collect() }
+    }
+
+    /// atoms on, as (unit, atom) pairs, over n_units units with n atoms each
+    fn on(s: &SetB, n_units: u32, n: u32) -> BTreeSet<(u32, u32)> {
+        (0..n_units).flat_map(|u| (0..n).map(move |a| (u, a))).filter(|&(u, a)| s.atom_on(u, a)).collect()
+    }
+
+    #[test]
+    fn intersect_is_the_union_of_what_is_on() {
+        let cases = [
+            set(false, &[0, 1], &[(2, &[0, 1]), (3, &[2])]),
+            set(false, &[1, 3], &[(0, &[1, 2]), (2, &[1, 3])]),
+            set(true, &[], &[]),
+            set(false, &[], &[]),
+            set(false, &[0, 1, 2, 3], &[]),
+        ];
+        for a in &cases {
+            for b in &cases {
+                let i = a.intersect(b);
+                let want: BTreeSet<(u32, u32)> = on(a, 4, 4).union(&on(b, 4, 4)).copied().collect();
+                assert_eq!(on(&i, 4, 4), want);
+            }
+        }
+    }
+
+    #[test]
+    fn complement_switches_off_exactly_what_is_on() {
+        let cases = [set(false, &[0, 1], &[(2, &[0, 1]), (3, &[2])]), set(true, &[], &[]), set(false, &[], &[]), set(false, &[], &[(1, &[0, 1, 2])])];
+        for a in &cases {
+            let c = a.complement(0..4, 4);
+            let all: BTreeSet<(u32, u32)> = (0..4).flat_map(|u| (0..4).map(move |x| (u, x))).collect();
+            let want: BTreeSet<(u32, u32)> = all.difference(&on(a, 4, 4)).copied().collect();
+            assert_eq!(on(&c, 4, 4), want);
+            // and back again
+            assert_eq!(on(&c.complement(0..4, 4), 4, 4), on(a, 4, 4));
+        }
+    }
 }
