@@ -9,6 +9,7 @@
 mod atlas;
 mod export;
 mod server;
+mod bias;
 mod blas;
 mod circuit;
 mod decompose;
@@ -98,11 +99,22 @@ Analyses:
   --circuit-norms M  with --circuit: frozen (default) = every norm keeps the scale it has in the full model at
                    that position, so switching parts off cannot inflate what is left; live = norms recompute
                    their scale (a post-norm then blows up any small rest to full size)
+  --bias NEURON    bias rows of a neuron (\"S18 #1267\"; several with ;): what one unit of its activation gives every
+                   later neuron (Δp, Δq), every later Q/K/V projection and every token's logit; what every
+                   token, earlier neuron, PLE dimension and bias gives it; the range its activation allows; and
+                   at every position of the prompt what it actually receives and gives – the received parts add up
+                   to its p and q exactly (checked). Full rows as float32 files in <html name>_bias/S<l>_<i>/
+  --bias-out DIR   with --bias: the folder (default <html name>_bias)
+  --bias-top N     entries listed by name per list (default 24)
   --circuit-show N with --circuit: leaves listed in the terminal (default 25)
   --circuit-paths N  with --circuit: self-expansion – after the minimal circuit, search the next one in what is
                    left without it, and so on, until the rest no longer gives the top token (every route is
                    found) or N paths (default 8; 1 = one minimal circuit). Every leaf, path, unit and
                    component is then switched off alone against the union of all paths
+  --circuit-from F  with --circuit: no search – load the circuit from a --dump-circuit file (same prompt and
+                   settings), test every atom alone against it, write the reports and the folder
+  --circuit-bias N  with --circuit: also the bias rows (see --bias) of the N neurons of the circuit that carry
+                   the most flow (all: every neuron of the circuit), into <folder>/bias/
   --circuit-out DIR  with --circuit: the result folder (default <html name>_circuit; none = no folder):
                    circuit.json, trace.json and layers/S…/p…/<attention|kv|mlp|ple>/<unit>.json with every
                    scalar product that is on, its value, its effect and its exact sources
@@ -187,6 +199,11 @@ struct Args {
     circuit_ref: Vec<String>,
     circuit_paths: Option<usize>,
     circuit_out: Option<String>,
+    circuit_from: Option<String>,
+    circuit_bias: Option<String>,
+    bias: Vec<String>,
+    bias_out: Option<String>,
+    bias_top: Option<usize>,
     gpu: Option<String>,
     selftest_gpu: bool,
 }
@@ -256,6 +273,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--circuit-paths" => a.circuit_paths = Some(number(val(&x)?, "--circuit-paths")?),
             "--circuit-out" => a.circuit_out = Some(val(&x)?),
+            "--circuit-from" => a.circuit_from = Some(val(&x)?),
+            "--circuit-bias" => a.circuit_bias = Some(val(&x)?),
+            "--bias" => a.bias.extend(val(&x)?.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())),
+            "--bias-out" => a.bias_out = Some(val(&x)?),
+            "--bias-top" => a.bias_top = Some(number(val(&x)?, "--bias-top")?),
             "--circuit-ref" => a.circuit_ref.extend(val(&x)?.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())),
             "--circuit-norms" => {
                 let v = val(&x)?;
@@ -289,7 +311,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if a.result_json.is_some() {
-        let modes = usize::from(a.decompose) + usize::from(a.circuit) + usize::from(!a.probe.is_empty()) + usize::from(!a.trace.is_empty());
+        let modes = usize::from(a.decompose) + usize::from(a.circuit) + usize::from(!a.probe.is_empty()) + usize::from(!a.trace.is_empty()) + usize::from(!a.bias.is_empty());
         if modes > 1 || a.answer.len() > 1 || a.neuron.len() > 1 || (modes > 0 && !a.neuron.is_empty()) || a.dump.is_some() || a.tokens_only || (a.atlas.is_some() && a.trace.is_empty()) {
             return Err("--result-json accepts one runtime analysis and one answer position per invocation".into());
         }
@@ -699,8 +721,26 @@ fn analyses(m: &Model, raw: &str, ids: &[u32], focus: usize, a: &Args, style: &S
                     Some(d) => Some(PathBuf::from(format!("{d}{suffix}"))),
                     None => Some(PathBuf::from(format!("{base}_circuit{suffix}"))),
                 },
+                from: a.circuit_from.as_ref().map(PathBuf::from),
+                bias: match a.circuit_bias.as_deref() {
+                    None => None,
+                    Some("all") => Some(usize::MAX),
+                    Some(n) => Some(n.parse().map_err(|_| "--circuit-bias expects a number or all")?),
+                },
+                bias_top: a.bias_top.unwrap_or(24),
             };
             circuit::run(m, seq, f, target, &o, style)?;
+        }
+        if !a.bias.is_empty() {
+            let mut neurons = Vec::new();
+            for t in &a.bias {
+                match neuron::parse_part(t).map_err(|e| format!("--bias {e}"))? {
+                    neuron::PartSpec::Neuron(l, i) => neurons.push((l, i)),
+                    _ => return Err(format!("--bias '{t}': give a neuron like \"S12 #2328\"")),
+                }
+            }
+            let o = bias::Opts { neurons, dir: PathBuf::from(a.bias_out.clone().map_or_else(|| format!("{base}_bias{suffix}"), |d| format!("{d}{suffix}"))), top: a.bias_top.unwrap_or(24) };
+            bias::run(m, seq, f, &o, style)?;
         }
         if a.decompose {
             let o = decompose::Opts { result_json: a.result_json.clone(), focus_only: a.focus_only, html: PathBuf::from(format!("{base}_decompose{suffix}.html")), k: a.top.unwrap_or(8) };
@@ -842,7 +882,7 @@ fn analyze(m: &Model, raw: &str, a: &Args, style: &Style) -> Result<(), String> 
     if focus < 0 || focus >= t {
         return Err(format!("--pos {} lies outside 0..{}", a.pos.unwrap_or(0), t - 1));
     }
-    if a.decompose || a.circuit || !a.probe.is_empty() || !a.trace.is_empty() {
+    if a.decompose || a.circuit || !a.probe.is_empty() || !a.trace.is_empty() || !a.bias.is_empty() {
         return analyses(m, raw, &ids, focus as usize, a, style);
     }
     let requested = a.answer.first().copied().unwrap_or(1);

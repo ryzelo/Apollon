@@ -62,6 +62,12 @@ pub struct Opts {
     pub paths: usize,
     /// the structured result folder (circuit.json, trace.json, layers/…); None = no folder
     pub out_dir: Option<PathBuf>,
+    /// no search: load the circuit from a --dump-circuit file of the same prompt and settings, test every
+    /// atom alone against it and write the reports and the folder
+    pub from: Option<PathBuf>,
+    /// the bias rows (crate::bias) of this many neurons of the circuit, those that carry the most flow
+    pub bias: Option<usize>,
+    pub bias_top: usize,
 }
 
 /// rows per variant pass (besides the clean prompt)
@@ -2467,76 +2473,91 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     // the ablation baseline: every atom off
     let (x_base, _) = e.focus_x(build_rows(&b, &State::empty(t, nl).complement(&g), &g));
     let signal_full = e.kl_to(&full.logits, &x_base);
-    {
-        if max_paths > 1 {
-            println!("{}", st.bold("path 1: the full model"));
-        }
+    if let Some(src) = &o.from {
+        // a circuit found before: every atom of it alone against it, then the union evaluation as usual
         let s0 = Instant::now();
-        let (logs, lv) = search(&mut e, o, total_atoms, st, 1);
-        paths.push(Path { signal: signal_full, reference: full_out, alone: e.base.out, alone_full: e.base.out, atoms: e.atoms_kept(), leaves: lv.len(), tests: e.st.tests, passes: e.st.passes, secs: s0.elapsed().as_secs_f32(), logs });
-        leaves.extend(lv);
-        merge_stats(&mut stats, &e.st);
+        let state = load_cut(src, &g, ids, o, &refs)?;
+        e = new_engine(state, Some(&full.logits));
+        eprintln!("circuit loaded from {}: {} atoms on · alone: top {} {} · KL {}", src.display(), big(e.atoms_kept()), tok(m, e.base.out.top[0].0), pct(e.base.out.top[0].1), num(e.base.out.kl, 4));
+        let pieces = out::atom_pieces(&e);
+        let cands: Vec<Vec<Piece>> = pieces.iter().map(|pc| vec![pc.clone()]).collect();
+        let outs = e.eval(&cands, "every atom of the loaded circuit alone");
+        leaves = pieces.into_iter().zip(outs).map(|(piece, out)| Leaf { piece, out, in_path: out, path: 1, value: None }).collect();
+        paths.push(Path { signal: signal_full, reference: full_out, alone: e.base.out, alone_full: e.base.out, atoms: e.atoms_kept(), leaves: leaves.len(), tests: e.st.tests, passes: e.st.passes, secs: s0.elapsed().as_secs_f32(), logs: Vec::new() });
         off_all = e.state.clone();
-    }
-    loop {
-        if paths.len() >= max_paths {
-            let rest = e.out_of(build_rows(&b, &off_all.complement(&g), &g), &p_full, plp_full).0;
-            stop = if !finite(&rest) {
-                format!("--circuit-paths {max_paths} reached; without all {} paths {}", paths.len(), overflow_txt(o))
-            } else if rest.top[0].0 == top_ref {
-                format!("--circuit-paths {max_paths} reached; without all {} paths the model still says {} ({})", paths.len(), tok(m, top_ref), pct(rest.top[0].1))
-            } else {
-                format!("--circuit-paths {max_paths} reached; without all {} paths the top token is {} ({})", paths.len(), tok(m, rest.top[0].0), pct(rest.top[0].1))
-            };
-            break;
+        stop = format!("no search: the circuit was loaded from {}", src.display());
+    } else {
+    {
+            if max_paths > 1 {
+                println!("{}", st.bold("path 1: the full model"));
+            }
+            let s0 = Instant::now();
+            let (logs, lv) = search(&mut e, o, total_atoms, st, 1);
+            paths.push(Path { signal: signal_full, reference: full_out, alone: e.base.out, alone_full: e.base.out, atoms: e.atoms_kept(), leaves: lv.len(), tests: e.st.tests, passes: e.st.passes, secs: s0.elapsed().as_secs_f32(), logs });
+            leaves.extend(lv);
+            merge_stats(&mut stats, &e.st);
+            off_all = e.state.clone();
         }
-        let k = paths.len() + 1;
-        let rest_state = off_all.complement(&g);
-        let (rest, rest_logits) = e.out_of(build_rows(&b, &rest_state, &g), &p_full, plp_full);
-        let signal = e.kl_to(&rest_logits, &x_base);
-        // NaN logits have no top token: a rest that overflows says nothing about further routes
-        if !finite(&rest) || !signal.is_finite() {
-            stop = format!(
-                "without the {} path{} {} – its top token cannot be read, so it is unknown whether further routes exist",
-                paths.len(),
-                if paths.len() == 1 { "" } else { "s" },
-                overflow_txt(o)
-            );
-            break;
+        loop {
+            if paths.len() >= max_paths {
+                let rest = e.out_of(build_rows(&b, &off_all.complement(&g), &g), &p_full, plp_full).0;
+                stop = if !finite(&rest) {
+                    format!("--circuit-paths {max_paths} reached; without all {} paths {}", paths.len(), overflow_txt(o))
+                } else if rest.top[0].0 == top_ref {
+                    format!("--circuit-paths {max_paths} reached; without all {} paths the model still says {} ({})", paths.len(), tok(m, top_ref), pct(rest.top[0].1))
+                } else {
+                    format!("--circuit-paths {max_paths} reached; without all {} paths the top token is {} ({})", paths.len(), tok(m, rest.top[0].0), pct(rest.top[0].1))
+                };
+                break;
+            }
+            let k = paths.len() + 1;
+            let rest_state = off_all.complement(&g);
+            let (rest, rest_logits) = e.out_of(build_rows(&b, &rest_state, &g), &p_full, plp_full);
+            let signal = e.kl_to(&rest_logits, &x_base);
+            // NaN logits have no top token: a rest that overflows says nothing about further routes
+            if !finite(&rest) || !signal.is_finite() {
+                stop = format!(
+                    "without the {} path{} {} – its top token cannot be read, so it is unknown whether further routes exist",
+                    paths.len(),
+                    if paths.len() == 1 { "" } else { "s" },
+                    overflow_txt(o)
+                );
+                break;
+            }
+            if rest.top[0].0 != top_ref {
+                stop = format!("without the {} path{} the model no longer says {}: top {} {} – every route that carries it is found", paths.len(), if paths.len() == 1 { "" } else { "s" }, tok(m, top_ref), tok(m, rest.top[0].0), pct(rest.top[0].1));
+                break;
+            }
+            // a rest this close to the baseline carries no route of its own: a path searched against it would
+            // only have to close a gap of at most ε
+            if signal <= 2.0 * o.kl {
+                stop = format!(
+                    "without the {} path{} the model still says {} ({}), but what is left differs from the ablation baseline (every atom off) by only KL {} ≤ 2ε: no route of its own is left",
+                    paths.len(),
+                    if paths.len() == 1 { "" } else { "s" },
+                    tok(m, top_ref),
+                    pct(rest.top[0].1),
+                    num(signal, 4)
+                );
+                break;
+            }
+            println!();
+            println!("{}", st.bold(&format!("path {k}: what is left without path{} 1–{}: top {} {} · KL to the full model {} · KL to the baseline {}", if k > 2 { "s" } else { "" }, k - 1, tok(m, rest.top[0].0), pct(rest.top[0].1), num(rest.kl, 4), num(signal, 4))));
+            let s0 = Instant::now();
+            let mut ek = new_engine(rest_state, None);
+            let atoms_start = ek.atoms_kept();
+            let (logs, lv) = search(&mut ek, o, total_atoms, st, k);
+            merge_stats(&mut stats, &ek.st);
+            let atoms = ek.atoms_kept();
+            if atoms == 0 || lv.is_empty() {
+                stop = format!("what is left without the {} path{} needs no atom at all ({} of them were on): it comes from the ablation baseline itself", paths.len(), if paths.len() == 1 { "" } else { "s" }, big(atoms_start));
+                break;
+            }
+            let alone_full = ek.out_of(ek.built.clone(), &p_full, plp_full).0;
+            paths.push(Path { signal, reference: rest, alone: ek.base.out, alone_full, atoms, leaves: lv.len(), tests: ek.st.tests, passes: ek.st.passes, secs: s0.elapsed().as_secs_f32(), logs });
+            leaves.extend(lv);
+            off_all = off_all.intersect(&ek.state, &g);
         }
-        if rest.top[0].0 != top_ref {
-            stop = format!("without the {} path{} the model no longer says {}: top {} {} – every route that carries it is found", paths.len(), if paths.len() == 1 { "" } else { "s" }, tok(m, top_ref), tok(m, rest.top[0].0), pct(rest.top[0].1));
-            break;
-        }
-        // a rest this close to the baseline carries no route of its own: a path searched against it would
-        // only have to close a gap of at most ε
-        if signal <= 2.0 * o.kl {
-            stop = format!(
-                "without the {} path{} the model still says {} ({}), but what is left differs from the ablation baseline (every atom off) by only KL {} ≤ 2ε: no route of its own is left",
-                paths.len(),
-                if paths.len() == 1 { "" } else { "s" },
-                tok(m, top_ref),
-                pct(rest.top[0].1),
-                num(signal, 4)
-            );
-            break;
-        }
-        println!();
-        println!("{}", st.bold(&format!("path {k}: what is left without path{} 1–{}: top {} {} · KL to the full model {} · KL to the baseline {}", if k > 2 { "s" } else { "" }, k - 1, tok(m, rest.top[0].0), pct(rest.top[0].1), num(rest.kl, 4), num(signal, 4))));
-        let s0 = Instant::now();
-        let mut ek = new_engine(rest_state, None);
-        let atoms_start = ek.atoms_kept();
-        let (logs, lv) = search(&mut ek, o, total_atoms, st, k);
-        merge_stats(&mut stats, &ek.st);
-        let atoms = ek.atoms_kept();
-        if atoms == 0 || lv.is_empty() {
-            stop = format!("what is left without the {} path{} needs no atom at all ({} of them were on): it comes from the ablation baseline itself", paths.len(), if paths.len() == 1 { "" } else { "s" }, big(atoms_start));
-            break;
-        }
-        let alone_full = ek.out_of(ek.built.clone(), &p_full, plp_full).0;
-        paths.push(Path { signal, reference: rest, alone: ek.base.out, alone_full, atoms, leaves: lv.len(), tests: ek.st.tests, passes: ek.st.passes, secs: s0.elapsed().as_secs_f32(), logs });
-        leaves.extend(lv);
-        off_all = off_all.intersect(&ek.state, &g);
     }
     // ---------------------------------------------------------------- the union of all paths
     let mut eu = if paths.len() == 1 { e } else { new_engine(off_all, Some(&full.logits)) };
@@ -2578,7 +2599,8 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     if let Some(dir) = &o.out_dir {
         let closure = out::write(&r, dir, &p_full, plp_full)?;
         let what = match closure {
-            Some(c) => format!("trace closure: largest relative deviation {}", sci(c)),
+            Some((c, Some(f))) => format!("trace closure: largest relative deviation {} · flow: roots sum to the logits, units pass on what they receive, largest relative deviation {}", sci(c), sci(f)),
+            Some((c, None)) => format!("trace closure: largest relative deviation {}", sci(c)),
             None => "too many atoms on to list them: units and components only".into(),
         };
         println!("{}", st.dim(&format!("result folder: {} ({what})", dir.display())));
@@ -2591,6 +2613,62 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
         crate::export::write(f, &result_json(&r, &full.logits))?;
     }
     Ok(())
+}
+
+/// The state of a --dump-circuit file (the same prompt and settings as now, else an error)
+fn load_cut(f: &std::path::Path, g: &Geo, ids: &[u32], o: &Opts, refs: &[Vec<u32>]) -> Result<State, String> {
+    let text = std::fs::read_to_string(f).map_err(|x| format!("{}: {x}", f.display()))?;
+    let j: Value = serde_json::from_str(&text).map_err(|x| format!("{}: {x}", f.display()))?;
+    let u32s = |v: &Value| -> Vec<u32> { v.as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default() };
+    if u32s(&j["tokens"]) != ids {
+        return Err(format!("{}: the circuit is for another token sequence (prompt, --chat or --answer differ)", f.display()));
+    }
+    let abl = if o.mean { "mean" } else { "zero" };
+    if j["ablation"].as_str() != Some(abl) || j["frozen_norms"].as_bool() != Some(o.frozen) {
+        return Err(format!("{}: the circuit was made with {} ablation and {} norms; give the same --circuit-ablation / --circuit-norms", f.display(), j["ablation"].as_str().unwrap_or("?"), if j["frozen_norms"].as_bool() == Some(true) { "frozen" } else { "live" }));
+    }
+    if o.mean {
+        let r: Vec<Vec<u32>> = j["ref_tokens"].as_array().map(|a| a.iter().map(&u32s).collect()).unwrap_or_default();
+        if r != refs {
+            return Err(format!("{}: the circuit was made with other reference prompts; give the same --circuit-ref", f.display()));
+        }
+    }
+    let set = |v: &Value| -> SetB {
+        let mut s = SetB { all: v["all"].as_bool().unwrap_or(false), ..Default::default() };
+        s.off = u32s(&v["off"]).into_iter().collect();
+        if let Some(m) = v["part"].as_object() {
+            for (k, a) in m {
+                if let Ok(u) = k.parse::<u32>() {
+                    s.part.insert(u, u32s(a).into_iter().collect());
+                }
+            }
+        }
+        s
+    };
+    let mut st = State::empty(g.t, g.layers.len());
+    for c in j["cells"].as_array().ok_or("no cells in the circuit file")? {
+        let (p, l) = (c["p"].as_u64().unwrap_or(0) as usize, c["l"].as_u64().unwrap_or(0) as usize);
+        if p >= g.t || l >= g.layers.len() {
+            return Err(format!("{}: cell [{p}] S{l} outside the model", f.display()));
+        }
+        let cell = &mut st.cells[p][l];
+        if let Some(sites) = c["sites"].as_object() {
+            for (name, v) in sites {
+                let s = ALL_SITES.iter().find(|s| s.name() == name).ok_or(format!("unknown site {name}"))?;
+                cell.sites[*s as usize] = set(v);
+            }
+        }
+        if let Some(heads) = c["heads"].as_object() {
+            if !heads.is_empty() {
+                cell.heads = vec![HeadB::default(); g.layers[l].nh];
+            }
+            for (h, v) in heads {
+                let h: usize = h.parse().map_err(|_| format!("bad head {h}"))?;
+                cell.heads[h] = HeadB { qk: set(&v["qk"]), av: set(&v["av"]) };
+            }
+        }
+    }
+    Ok(st)
 }
 
 /// A random cut over every kind of atom (test mode): whole sites, single units, single atoms, keys and

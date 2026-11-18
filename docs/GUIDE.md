@@ -350,11 +350,29 @@ is exact:
   means), the biases and, with LayerNorm, the mean subtraction;
 * q_e·k_e = over the Q atoms of the head (k held fixed), and again over the K atoms of the key (q held
   fixed), through the q/k norm and RoPE;
+* W_down[o,n]·act_n of a gated neuron = half over its gate atoms, half over its up atoms (φ = act(g)/g held);
 * a_j·v_j[e] = over the V atoms (the weight held fixed); the scores of the same key are its non-linear
   sources (softmax);
 * W_O[o,u]·z_u = over the mixing products of its head and dimension; W_down[o,n]·act_n = over the up atoms of
   the neuron (gate held fixed), the gate atoms are its non-linear sources;
 * the output: the target's (and the rival's) logit before a softcap, over the writer atoms at the focus.
+
+**The flow: the output as a matrix over every scalar product** (`flow.json`, `flows_residual.f32`). Hold the
+norm scales, the attention weights and the activation ratios act(x)/x at their values – then everything
+between the atoms is linear, and the output (the stream at the end, hence every logit) is an exact sum. Every
+atom passes on its part of it: its value times how the output moves per unit of it along everything
+downstream. One row per atom is "the matrix": what flows through that scalar product into the output, and
+from it what it adds to every token of the vocabulary. The parts that are no atom (embeddings, switched-off
+atoms, biases, norm terms) are the roots; all roots together give each logit exactly, and every head and
+neuron passes on exactly what it receives. A gated neuron a = act(g)·u = φ·g·u is split symmetrically, half
+over the gate atoms and half over the up atoms (the halves add up to a, as `--trace` splits a neuron). Q·K
+products only steer where a head looks and carry no flow; their effect shows in the switch-off tests.
+`flow.json` lists the main path from the output back to the tokens, every unit and edge with the exact part of
+target − rival it carries, the roots and the strongest atoms with the tokens their flow raises and lowers.
+
+`--circuit-from FILE` loads a circuit from a `--dump-circuit` file of the same prompt and settings instead of
+searching it, tests every atom alone against it and writes the reports and the folder anew – the Gemma 3 1B
+"2+2" circuit of 14,006 atoms in 50 seconds instead of 34 minutes.
 
 Every one of these splits is checked against the value the model recorded, and so is the residual stream
 at every stage and position (embedding + atoms + switched-off atoms + biases = the stream). The largest
@@ -397,6 +415,37 @@ key " Wednesday" [4], dimension 25.
   single atoms) and with the number of sequential steps: every accepted step is a standalone rerun. Gemma 3
   1B: 45 minutes to single atoms on an 8 GB M3 with the GPU, under 2 minutes to heads and neurons
   (`--circuit-depth 2`). `--circuit-depth` and `--circuit-tests` bound it.
+
+## Bias rows of neurons (`--bias`, `--circuit-bias`)
+
+```
+apollon -m … --chat --answer 7 --bias "S18 #1267; S16 #4740" "What is 2+2?"
+apollon -m … --circuit … --circuit-bias 8 "What is 2+2?"        (the 8 neurons of the circuit with the most flow)
+```
+
+A neuron a = act(p)·q reads the stream through its pre-norm: p = s·(g'·x) + c_g, q = s·(u'·x) + c_u. Everything
+written into the stream reaches x along a linear path (post-norms, layer scalars, each with its scale), so
+every source contributes to p and q exactly Δp = s · f(path) · A_p · (activation of the source), with A the
+static arrow – what one unit of the source gives at unit norm scales – and f the product of the runtime scales
+on the way. `--bias` writes, per neuron, these arrows in full:
+
+* **the bias row** – what one unit of its activation gives every later neuron (Δp, Δq), every later Q/K/V
+  projection (the whole vectors, before q/k norms and RoPE) and every token's logit;
+* **the bias column** – what every token embedding, every earlier neuron, PLE dimension and bias gives it per
+  unit (heads have no static arrow: what a head writes depends on what it reads; at runtime they count with
+  their actual output);
+* **the range** – its activation lies in [a_min, a_max] (the repertoire of `--neuron`), so the bias it can give
+  a target lies between a_min and a_max times the arrow;
+* **the token cases** – at every position of the prompt, the activations of all sources times their arrows:
+  what the neuron actually receives (by group and by source) and gives (to which later neurons, compared with
+  their own p), and at the focus what it adds to every token's logit.
+
+The received parts add up to p and q as the forward pass computed them, at every position – checked in every
+run (Gemma 3 1B ≤ 1.6·10⁻⁶, Pythia-14m with LayerNorm and biases ≤ 4.4·10⁻⁷) – so a = act(p)·q follows from
+them exactly. Files: `<name>_bias/S<l>_<i>/bias.json` and the full rows as float32 (`row_neurons.f32`,
+`row_qkv.f32`, `row_tokens.f32`, `column_*.f32`), about 4.6 MB per neuron of Gemma 3 1B; 0.7 s per neuron.
+For every neuron of a model the full rows would not fit (Gemma 3 1B: about 280 GB) – `--atlas` keeps the
+strongest arrows of all neurons instead.
 
 ## GPU: Metal and CUDA
 

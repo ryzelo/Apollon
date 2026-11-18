@@ -468,6 +468,9 @@ def search(hfs, kind, md, name, norms, abl, devs):
     F = json.load(open(os.path.join(WORK, f"circuit-{name}_circuit", "circuit.json")))
     if F["checks"]["trace_closure"] is not None:  # (None: too many atoms to list, no trace)
         devs[f"search, {norms} norms, {abl}: trace closure ({len(F['paths'])} path(s))"] = (F["checks"]["trace_closure"], 0.0)
+        # the flow: all roots give the logits, every unit passes on what it receives, the matrix gives the stream
+        if F["checks"]["flow_worst_deviation"] is not None:  # (None: no atom on)
+            devs[f"search, {norms} norms, {abl}: flow"] = (F["checks"]["flow_worst_deviation"], 0.0)
     # complement: every atom of the circuit off, everything else on
     C = dict(J)
     C["logits_circuit"] = J["logits_complement"]

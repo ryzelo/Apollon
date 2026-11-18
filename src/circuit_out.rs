@@ -122,7 +122,10 @@ struct Snap {
 /// one source of an atom: the atom it reads, how much of its value comes from there
 struct Src {
     from: usize,
+    /// contribution to the atom's value: k · (value of the source)
     c: f32,
+    /// the exact coefficient k (everything between the two atoms, the other factors held at their value)
+    k: f32,
     via: &'static str,
 }
 
@@ -346,6 +349,15 @@ impl A {
     }
 }
 
+/// act(x)/x, the factor that makes an activation linear at the point x (its limit at 0)
+fn ratio(f: fn(f32) -> f32, x: f32) -> f32 {
+    if x.abs() > 1e-12 {
+        f(x) / x
+    } else {
+        f(1e-4) / 1e-4
+    }
+}
+
 /// RoPE as a matrix: the coefficients R[e][e'] of row e (after the rotation) at position pos
 fn rope_row(r: Option<&Rope>, pos: usize, e: usize) -> Vec<(usize, f32)> {
     let Some(r) = r else { return vec![(e, 1.0)] };
@@ -367,6 +379,18 @@ fn rope_row(r: Option<&Rope>, pos: usize, e: usize) -> Vec<(usize, f32)> {
     let (s, c) = (pf * r.inv_freq[i]).sin_cos();
     // v'[i0] = x0·c − x1·s, v'[i1] = x1·c + x0·s
     vec![(e, c), (partner, if first { -s } else { s })]
+}
+
+/// every atom that is on, as a piece of its own (for --circuit-from)
+pub(super) fn atom_pieces(e: &Engine) -> Vec<Piece> {
+    on_atoms(e)
+        .into_iter()
+        .map(|a| match a {
+            A::W { l, p, s, u, a } => Piece::Atoms { l, p, s, u: u as usize, a: Arc::new(vec![a]) },
+            A::Qk { l, p, h, j, e } => Piece::KeyDims { l, p, h, j, av: false, e: Arc::new(vec![e as u32]) },
+            A::Av { l, p, h, j, e } => Piece::KeyDims { l, p, h, j, av: true, e: Arc::new(vec![e as u32]) },
+        })
+        .collect()
 }
 
 /// the atoms that are on in the engine's state
@@ -512,7 +536,7 @@ fn capped(items: Vec<Value>, sums: &[f32]) -> (Value, Value) {
 
 /// Write the result folder. Returns the trace closure (largest relative deviation of any decomposition), or
 /// None when there are too many atoms to list (then there is no trace, only units and components).
-pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> Result<Option<f32>, String> {
+pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> Result<Option<(f32, Option<f32>)>, String> {
     let e = r.e;
     let m = e.m;
     let g = &e.g;
@@ -788,7 +812,8 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         if let Some(ws) = writers.get(&(p, c)) {
             for &(wi, lw, kind) in ws {
                 if let Some(sc) = cx.visible(st, lw, kind) {
-                    info.sources.push(Src { from: wi, c: k * cx.post(lw, kind, p, c) * sc * infos_value(&atoms, wi, &cx), via: "residual" });
+                    let coef = k * cx.post(lw, kind, p, c) * sc;
+                    info.sources.push(Src { from: wi, c: coef * infos_value(&atoms, wi, &cx), k: coef, via: "residual" });
                 }
             }
         }
@@ -824,7 +849,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                     for &k in v {
                         let val = infos[k].value;
                         on_sum += val;
-                        info.sources.push(Src { from: k, c: w * val, via: "mixing" });
+                        info.sources.push(Src { from: k, c: w * val, k: w, via: "mixing" });
                     }
                 }
                 // switched-off products of this head and dimension: their means (0 with zero ablation)
@@ -852,33 +877,54 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                 let up_abl = cx.row_ablated(l, p, Site::Up, n);
                 let up_b = cx.bias(l, Site::Up, n as usize);
                 cx.check(up_on + up_abl + up_b, li.up[p * ff + n as usize], up_on.abs() + up_abl.abs() + up_b.abs(), || format!("up of S{l} #{n} [{p}]"));
+                let uv = li.up[p * ff + n as usize];
                 if lg.gated {
+                    // a = act(g)·u = φ·g·u with φ = act(g)/g held at its value: split symmetrically,
+                    // half over the gate atoms (u fixed), half over the up atoms (g fixed) – the halves add
+                    // up to φ·g·u exactly (as --trace splits a neuron)
                     let gv = li.gate[p * ff + n as usize];
-                    let fg = f(gv);
-                    for &k in &up_atoms {
-                        info.sources.push(Src { from: k, c: w * fg * infos[k].value, via: "up (gate held fixed)" });
-                    }
-                    info.rest.push(("switched-off up atoms", w * fg * up_abl));
-                    info.rest.push(("up bias", w * fg * up_b));
+                    let phi = ratio(f, gv);
                     let gate_atoms = by_row.get(&(l, p, Site::Gate, n)).cloned().unwrap_or_default();
                     let g_on: f32 = gate_atoms.iter().map(|&k| infos[k].value).sum();
                     let g_abl = cx.row_ablated(l, p, Site::Gate, n);
                     cx.check(g_on + g_abl, gv, g_on.abs() + g_abl.abs(), || format!("gate of S{l} #{n} [{p}]"));
-                    for &k in &gate_atoms {
-                        info.nonlinear.push((k, infos[k].value, "gate pre-activation"));
-                    }
-                } else {
+                    let (ku, kg) = (w * phi * 0.5 * gv, w * phi * 0.5 * uv);
                     for &k in &up_atoms {
-                        info.nonlinear.push((k, infos[k].value, "pre-activation"));
+                        info.sources.push(Src { from: k, c: ku * infos[k].value, k: ku, via: "up (split with the gate)" });
                     }
-                    info.rest.push(("activation of the neuron (not linear in its inputs)", info.value));
+                    for &k in &gate_atoms {
+                        info.sources.push(Src { from: k, c: kg * infos[k].value, k: kg, via: "gate (split with up)" });
+                    }
+                    info.rest.push(("switched-off up atoms", ku * up_abl));
+                    info.rest.push(("up bias", ku * up_b));
+                    info.rest.push(("switched-off gate atoms", kg * g_abl));
+                } else {
+                    // a = act(u) = φ·u with φ = act(u)/u held at its value
+                    let ku = w * ratio(f, uv);
+                    for &k in &up_atoms {
+                        info.sources.push(Src { from: k, c: ku * infos[k].value, k: ku, via: "up (activation ratio held fixed)" });
+                    }
+                    info.rest.push(("switched-off up atoms", ku * up_abl));
+                    info.rest.push(("up bias", ku * up_b));
                 }
             }
-            A::W { l, p, s: Site::PleProj, u: x, .. } => {
-                for &k in by_row.get(&(l, p, Site::PleGate, x)).map(|v| &v[..]).unwrap_or(&[]) {
-                    info.nonlinear.push((k, infos[k].value, "PLE gate pre-activation"));
+            A::W { l, p, s: Site::PleProj, u: x, a: o2 } => {
+                // g_e = act(gate_e)·pl_e = (g_e/gate_e)·gate_e: linear in the gate with that ratio held fixed
+                let lg = &g.layers[l];
+                let dp = lg.dp.unwrap_or(0);
+                let w = e.b.weights(l, Site::PleProj, x)[o2 as usize];
+                let gate_atoms = by_row.get(&(l, p, Site::PleGate, x)).cloned().unwrap_or_default();
+                let gsum: f32 = gate_atoms.iter().map(|&k| infos[k].value).sum::<f32>() + cx.row_ablated(l, p, Site::PleGate, x);
+                let gv = tr.inputs[l].ple_g[p * dp + x as usize];
+                if gsum.abs() > 1e-20 {
+                    let kg = w * gv / gsum;
+                    for &k in &gate_atoms {
+                        info.sources.push(Src { from: k, c: kg * infos[k].value, k: kg, via: "PLE gate (ratio held fixed)" });
+                    }
+                    info.rest.push(("switched-off PLE gate atoms", kg * cx.row_ablated(l, p, Site::PleGate, x)));
+                } else {
+                    info.rest.push(("gated per-layer input (gate exactly 0)", info.value));
                 }
-                info.rest.push(("gated per-layer input (not linear in its inputs)", info.value));
             }
             A::Qk { l, p, h, j, e: x } => {
                 let lg = &g.layers[l];
@@ -896,7 +942,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                     let row = (h * lg.hd + x2) as u32;
                     let coef = rc * nq * k;
                     for &ai in by_row.get(&(l, p, Site::Q, row)).map(|v| &v[..]).unwrap_or(&[]) {
-                        info.sources.push(Src { from: ai, c: coef * infos[ai].value, via: "q (k held fixed)" });
+                        info.sources.push(Src { from: ai, c: coef * infos[ai].value, k: coef, via: "q (k held fixed)" });
                         parts[0] += coef * infos[ai].value;
                     }
                     parts[1] += coef * cx.row_ablated(l, p, Site::Q, row);
@@ -913,7 +959,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                     let row = (gr * lg.hd + x2) as u32;
                     let coef = rc * nk * q;
                     for &ai in by_row.get(&(lk, j, Site::K, row)).map(|v| &v[..]).unwrap_or(&[]) {
-                        info.sources.push(Src { from: ai, c: coef * infos[ai].value, via: "k (q held fixed)" });
+                        info.sources.push(Src { from: ai, c: coef * infos[ai].value, k: coef, via: "k (q held fixed)" });
                         kp[0] += coef * infos[ai].value;
                     }
                     kp[1] += coef * cx.row_ablated(lk, j, Site::K, row);
@@ -937,7 +983,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                 let coef = a_j * nv;
                 let mut parts = [0f32; 3];
                 for &ai in by_row.get(&(lk, j, vs, row)).map(|v| &v[..]).unwrap_or(&[]) {
-                    info.sources.push(Src { from: ai, c: coef * infos[ai].value, via: "v (weight held fixed)" });
+                    info.sources.push(Src { from: ai, c: coef * infos[ai].value, k: coef, via: "v (weight held fixed)" });
                     parts[0] += coef * infos[ai].value;
                 }
                 parts[1] = coef * cx.row_ablated(lk, j, vs, row);
@@ -1017,6 +1063,39 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         root.push(json!({"token": {"id": e.ys[yi], "text": m.tok.piece(e.ys[yi])}, "logit_before_softcap": z,
             "softcap": m.logit_cap, "parts": parts.iter().map(|(k, v)| json!({"part": k, "value": v})).collect::<Vec<_>>(), "closure": dev}));
     }
+    // ------------------------------------------------------------ the flow: the output, split over every atom
+    // With the norm scales, the attention weights and the activation ratios act(x)/x held at their values,
+    // everything between the atoms is linear. Then every atom passes on an exact part of the output: its
+    // value times its sensitivity S_A (how the output moves per unit of the atom's value along everything
+    // downstream). The parts that are not atoms – embeddings, switched-off atoms, biases, norm terms – are the
+    // roots; all roots together give the output exactly. Q·K products only steer where heads look (the
+    // weights are held), so they and the Q/K atoms carry no flow; their causal role shows in the switch-off
+    // tests.
+    let flow = if detailed && !atoms.is_empty() { Some(flow_split(&atoms, &infos, &cx, e, m, g, &tr, fin, fs, fnorm, focus)) } else { None };
+    let fnode_name = |n: &FNode| match n {
+        FNode::Root(s) => s.clone(),
+        FNode::U(u) => u.name(),
+        FNode::Output => "output".to_string(),
+    };
+    // per unit: what flows out of it, what flows in (from which unit or root)
+    let mut unit_out: HashMap<Unit, Vec<f32>> = HashMap::new();
+    let mut unit_in: HashMap<Unit, Vec<(FNode, Vec<f32>)>> = HashMap::new();
+    let mut unit_to: HashMap<Unit, Vec<(FNode, Vec<f32>)>> = HashMap::new();
+    if let Some(fl) = &flow {
+        let kk = fl.toks.len();
+        for ((a, b), v) in &fl.edges {
+            if let FNode::U(ua) = a {
+                let x = unit_out.entry(*ua).or_insert_with(|| vec![0f32; kk]);
+                x.iter_mut().zip(v).for_each(|(p2, q)| *p2 += q);
+                unit_to.entry(*ua).or_default().push((b.clone(), v.clone()));
+            }
+            if let FNode::U(ub) = b {
+                unit_in.entry(*ub).or_default().push((a.clone(), v.clone()));
+            }
+        }
+    }
+    let diff = |v: &[f32]| v[0] - v[1];
+    let flow_json = |v: &[f32]| json!({"target_logit": v[0], "rival_logit": v[1], "difference": v[0] - v[1]});
     // ------------------------------------------------------------ units, edges between units
     let mut unit_atoms: BTreeMap<Unit, Vec<usize>> = BTreeMap::new();
     for (i, a) in atoms.iter().enumerate() {
@@ -1112,6 +1191,17 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             "direct_to_output_logit_difference": if ids.iter().any(|&i| infos[i].to_output.is_some()) { json!(direct) } else { Value::Null },
             "steps_to_output": depth.get(&Node::U(*u)),
             "reads_from_units": reads, "read_by_units": read_by, "file": file,
+            "flow": unit_out.get(u).map(|v| flow_json(v)),
+            "flow_from": unit_in.get(u).map(|v| {
+                let mut v: Vec<&(FNode, Vec<f32>)> = v.iter().collect();
+                v.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+                v.iter().take(MAX_EDGES).map(|(n2, x)| json!({"from": fnode_name(n2), "flow": flow_json(x)})).collect::<Vec<_>>()
+            }),
+            "flow_to": unit_to.get(u).map(|v| {
+                let mut v: Vec<&(FNode, Vec<f32>)> = v.iter().collect();
+                v.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+                v.iter().take(MAX_EDGES).map(|(n2, x)| json!({"to": fnode_name(n2), "flow": flow_json(x)})).collect::<Vec<_>>()
+            }),
         });
         if detailed {
             let atoms_json: Vec<Value> = ids
@@ -1134,6 +1224,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                         "nonlinear_sources": inf.nonlinear.iter().map(|(k, v, w)| json!({"from": inf_name(&atoms, *k), "value": v, "role": w})).collect::<Vec<_>>(),
                         "rest": inf.rest.iter().filter(|r| r.1 != 0.0).map(|(k, v)| json!({"part": k, "value": v})).collect::<Vec<_>>(),
                         "closure": inf.closure,
+                        "flow": flow.as_ref().map(|fl| { let kk = fl.toks.len(); flow_json(&fl.atom[i * kk..i * kk + 2]) }),
                         "to_output": inf.to_output.map(|(a, b2)| json!({"target_logit": a, "rival_logit": b2, "difference": a - b2})),
                         "used_by": ub_l, "used_by_not_listed": ub_rest,
                         "used_nonlinearly_by": used_nl[i].iter().map(|(k, w)| json!({"atom": inf_name(&atoms, *k), "role": w})).collect::<Vec<_>>(),
@@ -1206,6 +1297,385 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             "closure": closure_v, "closure_worst_at": worst_at,
         }),
     )?;
+    // ------------------------------------------------------------ flow.json and the matrix
+    let mut flow_checks = Value::Null;
+    let mut flow_dev: Option<f32> = None;
+    if let Some(fl) = &flow {
+        let kk = fl.toks.len();
+        let total = fl.logits[0] - fl.logits[1];
+        let share = |v: &[f32]| if total.abs() > 1e-9 { json!(diff(v) / total) } else { Value::Null };
+        let tokj = |t: u32| json!({"id": t, "text": m.tok.piece(t)});
+        // units by what flows out of them (onto target − rival)
+        let mut units_f: Vec<(&Unit, &Vec<f32>)> = unit_out.iter().collect();
+        units_f.sort_by(|a, b| diff(b.1).abs().partial_cmp(&diff(a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        let mut edges_f: Vec<(&(FNode, FNode), &Vec<f32>)> = fl.edges.iter().collect();
+        edges_f.sort_by(|a, b| diff(b.1).abs().partial_cmp(&diff(a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        // roots by kind and position
+        let mut roots: Vec<(&String, Vec<f32>)> = Vec::new();
+        {
+            let mut acc: BTreeMap<&String, Vec<f32>> = BTreeMap::new();
+            for ((a, _), v) in &fl.edges {
+                if let FNode::Root(r) = a {
+                    let x = acc.entry(r).or_insert_with(|| vec![0f32; kk]);
+                    x.iter_mut().zip(v).for_each(|(p2, q)| *p2 += q);
+                }
+            }
+            roots.extend(acc);
+            roots.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        // the main path: from the output backwards, always along the incoming edge that carries the most
+        let mut path: Vec<Value> = Vec::new();
+        let mut node = FNode::Output;
+        let mut seen: Vec<FNode> = Vec::new();
+        for _ in 0..40 {
+            let mut ins: Vec<(&FNode, &Vec<f32>)> = fl.edges.iter().filter(|((_, b), _)| *b == node).map(|((a, _), v)| (a, v)).collect();
+            if ins.is_empty() {
+                break;
+            }
+            ins.sort_by(|a, b| diff(b.1).partial_cmp(&diff(a.1)).unwrap_or(std::cmp::Ordering::Equal));
+            let into: f32 = ins.iter().map(|(_, v)| diff(v)).sum();
+            path.push(json!({"into": fnode_name(&node), "flow_into_it": into, "share_of_total": if total.abs() > 1e-9 { json!(into / total) } else { Value::Null },
+                "strongest_inputs": ins.iter().take(5).map(|(a, v)| json!({"from": fnode_name(a), "flow": diff(v), "share_of_total": share(v)})).collect::<Vec<_>>()}));
+            seen.push(node.clone());
+            let next = ins[0].0.clone();
+            if matches!(next, FNode::Root(_)) || seen.contains(&next) {
+                path.push(json!({"into": fnode_name(&next), "end": "a root: no atom before it"}));
+                break;
+            }
+            node = next;
+        }
+        let worst = fl.dev_roots.max(fl.dev_units.0).max(fl.dev_matrix);
+        flow_dev = Some(worst);
+        flow_checks = json!({"roots_sum_to_the_logits": fl.dev_roots, "every_unit_passes_on_what_it_receives": fl.dev_units.0, "worst_unit": fl.dev_units.1,
+            "matrix_rows_and_roots_sum_to_the_stream": if fl.matrix.is_some() { json!(fl.dev_matrix) } else { Value::Null }});
+        if let Some(mx) = &fl.matrix {
+            let bytes: Vec<u8> = mx.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(dir.join("flows_residual.f32"), bytes).map_err(|x| format!("{}: {x}", dir.display()))?;
+            write_json_as(dir, "flows_residual.json", &json!({
+                "what": "Row i = the flow of atom i into the stream at the focus at the end (before the final norm), float32 little-endian, rows × columns. The logit of any token t is W_U[t] · N(row) with N the final norm at its frozen scale (RMS: s·w⊙x; LayerNorm: s·w⊙(x − mean x)); the roots in flow.json (embeddings, switched-off atoms, biases) plus every writer's direct part give the stream exactly.",
+                "rows": atoms.len(), "columns": d, "final_norm_scale": fs, "final_norm": fnorm.map(|nm| if nm.rms { "rms" } else { "layernorm" }),
+                "atoms": atoms.iter().map(|a| a.name()).collect::<Vec<_>>()}), false)?;
+        }
+        let top_atoms: Vec<Value> = {
+            let mut by: Vec<usize> = (0..atoms.len()).collect();
+            by.sort_by(|&a, &b| (fl.atom[b * kk] - fl.atom[b * kk + 1]).abs().partial_cmp(&(fl.atom[a * kk] - fl.atom[a * kk + 1]).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            by.iter().take(300).map(|&i| json!({"atom": atoms[i].name(), "unit": atoms[i].unit(g).name(), "flow": flow_json(&fl.atom[i * kk..i * kk + 2]), "share_of_total": share(&fl.atom[i * kk..i * kk + 2])})).collect()
+        };
+        write_json(dir, "flow.json", &json!({
+            "what": "The output split over every atom. With the norm scales, the attention weights and the activation ratios act(x)/x held at their values, everything between atoms is linear, so every atom passes on an exact part of the output (value × sensitivity). The parts that are no atom are the roots; all roots together give each logit exactly. Units pass on exactly what they receive. Q·K products only steer where heads look and carry no flow (their effect shows in the switch-off tests). difference = onto the target's logit minus onto the rival's, before a softcap.",
+            "tokens": fl.toks.iter().enumerate().map(|(ki, &t)| json!({"token": tokj(t), "logit_before_softcap": fl.logits[ki], "sum_of_the_roots": fl.roots_sum[ki]})).collect::<Vec<_>>(),
+            "target_minus_rival": total,
+            "main_path": path,
+            "units": units_f.iter().map(|(u, v)| json!({"unit": u.name(), "file": u.file(wl, wp), "flow": flow_json(v), "share_of_total": share(v),
+                "per_token": fl.toks.iter().zip(v.iter()).map(|(&t, x)| json!({"token": m.tok.piece(t), "flow": x})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+            "edges": edges_f.iter().take(500).map(|((a, b), v)| json!({"from": fnode_name(a), "to": fnode_name(b), "flow": flow_json(v), "share_of_total": share(v)})).collect::<Vec<_>>(),
+            "roots": roots.iter().map(|(r, v)| json!({"root": r, "flow": flow_json(v), "share_of_total": share(v)})).collect::<Vec<_>>(),
+            "atoms": top_atoms,
+            "voices": fl.voices.iter().map(|(i, up, down)| json!({"atom": atoms[*i].name(), "flow": flow_json(&fl.atom[i * kk..i * kk + 2]),
+                "raises": up.iter().map(|(t, v)| json!({"token": m.tok.piece(*t), "logit": v})).collect::<Vec<_>>(),
+                "lowers": down.iter().map(|(t, v)| json!({"token": m.tok.piece(*t), "logit": v})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+            "matrix": if fl.matrix.is_some() { json!({"file": "flows_residual.f32", "index": "flows_residual.json", "rows": atoms.len(), "columns": d}) } else { Value::Null },
+            "checks": flow_checks,
+        }))?;
+        // ---- the protocol: every step in the order the model computes it
+        let sub_of = |a: &A| -> u8 {
+            match *a {
+                A::W { s, .. } => match s {
+                    Site::Q | Site::K | Site::V => 0,
+                    Site::O => 3,
+                    Site::Gate | Site::Up => 4,
+                    Site::Down => 5,
+                    Site::PleIn | Site::PleGate => 6,
+                    Site::PleProj => 7,
+                },
+                A::Qk { .. } => 1,
+                A::Av { .. } => 2,
+            }
+        };
+        let lp_of = |a: &A| -> (usize, usize) {
+            match *a {
+                A::W { l, p, .. } | A::Qk { l, p, .. } | A::Av { l, p, .. } => (l, p),
+            }
+        };
+        let mut order_a: Vec<usize> = (0..atoms.len()).collect();
+        order_a.sort_by_key(|&i| {
+            let (l, p) = lp_of(&atoms[i]);
+            (l, sub_of(&atoms[i]), p, i)
+        });
+        let mut lines = String::with_capacity(atoms.len() * 400);
+        for (step, &i) in order_a.iter().enumerate() {
+            let inf = &infos[i];
+            let (l, p) = lp_of(&inf.a);
+            let mut src: Vec<&Src> = inf.sources.iter().collect();
+            src.sort_by(|a, b| b.c.abs().partial_cmp(&a.c.abs()).unwrap_or(std::cmp::Ordering::Equal));
+            let v = json!({"step": step + 1, "layer": l, "position": p, "token": m.tok.piece(e.ids[p]), "atom": inf.a.name(), "unit": inf.a.unit(g).name(),
+                "value": inf.value, "value_when_off": inf.ablated, "flow": flow_json(&fl.atom[i * kk..i * kk + 2]),
+                "reads": src.iter().take(3).map(|s2| json!({"from": atoms[s2.from].name(), "contribution": s2.c, "via": s2.via})).collect::<Vec<_>>(),
+                "rest": inf.rest.iter().filter(|r| r.1 != 0.0).map(|(k, v)| json!({"part": k, "value": v})).collect::<Vec<_>>()});
+            lines += &serde_json::to_string(&v).unwrap();
+            lines.push('\n');
+        }
+        std::fs::write(dir.join("atoms_in_order.jsonl"), lines).map_err(|x| format!("{}: {x}", dir.display()))?;
+        let unit_key = |u: &Unit| -> (usize, u8, usize) {
+            match *u {
+                Unit::Kv { l, p, .. } => (l, 0, p),
+                Unit::Head { l, p, .. } => (l, 1, p),
+                Unit::Neuron { l, p, .. } => (l, 2, p),
+                Unit::Ple { l, p, .. } => (l, 3, p),
+            }
+        };
+        let mut units_o: Vec<Unit> = unit_out.keys().copied().collect();
+        units_o.sort_by_key(|u| (unit_key(u), *u));
+        let q = |t: u32| format!("{:?}", m.tok.piece(t));
+        let pct1 = |x: f32| format!("{:.1}%", x * 100.0);
+        let tgt = q(e.ys[0]);
+        let riv = q(e.ys[1]);
+        let mut md = String::new();
+        md += &format!("# How the model computes {tgt} – step by step\n\n");
+        md += &format!("Model: {} · prediction at position {focus} · target {tgt}, rival {riv}\n\n", m.name);
+        md += "Tokens: ";
+        md += &e.ids.iter().enumerate().map(|(i, &t)| format!("[{i}] {:?}", m.tok.piece(t))).collect::<Vec<_>>().join(" ");
+        md += &format!(
+            "\n\nThe margin of {tgt} over {riv} (logits before a softcap): **{:+.3}** ({tgt} {:.3}, {riv} {:.3}). Every step below passes on an exact part of it (norm scales, attention weights and activation ratios held at their values; the parts add up to the margin exactly). A step is one head, K/V group, neuron or PLE dimension at one position, in the order the model computes them; Q·K products only steer where heads look and are not counted as flow.\n\nHow to read it: *passes on* and *what it adds to the output* describe the part of the final answer that travels through a step – flow is conserved, every step passes on exactly what it receives, so steps on the same route share the same signature. What a step itself decides is its *decision*: where a head looks (its attention weights, set by the Q·K products) and how strongly a neuron fires (its gate). Those are the non-linear switches the transport runs through.\n\n",
+            total, fl.logits[0], fl.logits[1]
+        );
+        md += "## Where it starts\n\n";
+        let mut emb: Vec<(&String, &Vec<f32>)> = roots.iter().filter(|(r, _)| r.starts_with("embedding")).map(|(r, v)| (*r, v)).collect();
+        emb.sort_by(|a, b| diff(b.1).abs().partial_cmp(&diff(a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        let emb_total: f32 = emb.iter().map(|(_, v)| diff(v)).sum();
+        for (r, v) in emb.iter().take(6) {
+            md += &format!("- {r}: {:+.3} ({})\n", diff(v), pct1(diff(v) / total));
+        }
+        md += &format!(
+            "- together the token embeddings: {:+.3} ({}); the rest, {:+.3} ({}), comes from what the switched-off parts give anyway (their means over the references, the biases): the computation every prompt of this kind shares\n\n",
+            emb_total,
+            pct1(emb_total / total),
+            total - emb_total,
+            pct1((total - emb_total) / total)
+        );
+        md += "## The steps\n\n";
+        let mut small = 0usize;
+        let mut why_dev = 0f32;
+        let mut steps_json: Vec<Value> = Vec::new();
+        for (k, u) in units_o.iter().enumerate() {
+            let v = &unit_out[u];
+            let (l, p) = u.lp();
+            let n_at = unit_atoms.get(u).map_or(0, |x| x.len());
+            let mut ins: Vec<(FNode, Vec<f32>)> = unit_in.get(u).cloned().unwrap_or_default();
+            ins.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            let voice = fl.unit_voices.get(u);
+            let off = unit_fx.get(u);
+            steps_json.push(json!({"step": k + 1, "unit": u.name(), "layer": l, "position": p, "token": m.tok.piece(e.ids[p]), "multiplications": n_at,
+                "passes_on": flow_json(v), "share_of_margin": share(v),
+                "reads": ins.iter().take(6).map(|(n2, x)| json!({"from": fnode_name(n2), "flow": diff(x)})).collect::<Vec<_>>(),
+                "raises": voice.map(|(up, _)| up.iter().map(|(t, x)| json!({"token": m.tok.piece(*t), "logit": x})).collect::<Vec<_>>()),
+                "lowers": voice.map(|(_, dn)| dn.iter().map(|(t, x)| json!({"token": m.tok.piece(*t), "logit": x})).collect::<Vec<_>>()),
+                "switched_off_alone": off.map(|o| out_json(m, o)), "file": u.file(wl, wp)}));
+            let steps_len = steps_json.len();
+            if (diff(v) / total).abs() < 0.005 {
+                small += 1;
+                continue;
+            }
+            md += &format!("### {}. Layer {l}, position {p} ({:?}): {} – {} multiplications\n", k + 1, m.tok.piece(e.ids[p]), u.name(), n_at);
+            md += &format!("- reads: {}\n", ins.iter().take(4).map(|(n2, x)| format!("{} {:+.3}", fnode_name(n2), diff(x))).collect::<Vec<_>>().join(" · "));
+            md += &format!("- passes on **{:+.3}** of the margin ({}): {tgt} {:+.3}, {riv} {:+.3}\n", diff(v), pct1(diff(v) / total), v[0], v[1]);
+            if let Some((up, dn)) = voice {
+                md += &format!(
+                    "- what it adds to the output: raises {} · lowers {}\n",
+                    up.iter().take(5).map(|(t, _)| q(*t)).collect::<Vec<_>>().join(", "),
+                    dn.iter().take(5).map(|(t, _)| q(*t)).collect::<Vec<_>>().join(", ")
+                );
+            }
+            // the decision of the step: where a head looks, how strongly a neuron fires
+            let li = &tr.inputs[l];
+            let decision: Option<String> = match *u {
+                Unit::Head { h, .. } => {
+                    let nh = g.layers[l].nh;
+                    let pr = &li.probs[(p * nh + h) * t..(p * nh + h + 1) * t];
+                    let mut ks: Vec<usize> = g.keys(l, p).collect();
+                    ks.sort_by(|a, b| pr[*b].partial_cmp(&pr[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                    Some(format!("looks at {}", ks.iter().take(4).map(|&j| format!("[{j}] {:?} {:.0}%", m.tok.piece(e.ids[j]), pr[j] * 100.0)).collect::<Vec<_>>().join(" · ")))
+                }
+                Unit::Neuron { n, .. } => {
+                    let ff = g.layers[l].ff;
+                    let (a_v, u_v) = (li.act[p * ff + n as usize], li.up[p * ff + n as usize]);
+                    if g.layers[l].gated {
+                        let gv = li.gate[p * ff + n as usize];
+                        Some(format!("fires a = {a_v:+.3} (gate {gv:+.3} → act {:+.3}, up {u_v:+.3})", if u_v != 0.0 { a_v / u_v } else { 0.0 }))
+                    } else {
+                        Some(format!("fires a = {a_v:+.3} (pre-activation {u_v:+.3})"))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(dsc) = &decision {
+                md += &format!("- decision: {dsc}\n");
+                steps_json[steps_len - 1]["decision"] = json!(dsc);
+            }
+            // why: the decision split exactly over the multiplications that make it, grouped by their sources
+            let src_name = |i: usize| -> String { atoms[i].unit(g).name() };
+            let rest_name = |name: &str, pos: usize| -> String { format!("{name} [{pos}]") };
+            let fmt_parts = |parts: &[(String, f32)], k: usize| -> String { parts.iter().take(k).map(|(n2, v)| format!("{n2} {v:+.3}")).collect::<Vec<_>>().join(" · ") };
+            let sorted = |mut acc: HashMap<String, f32>| -> Vec<(String, f32)> {
+                let mut v: Vec<(String, f32)> = acc.drain().collect();
+                v.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                v
+            };
+            match *u {
+                Unit::Neuron { n, .. } => {
+                    let lg = &g.layers[l];
+                    let ff = lg.ff;
+                    let f = act_fn(m.blocks[l].mlp.act);
+                    let (a_v, uv) = (li.act[p * ff + n as usize], li.up[p * ff + n as usize]);
+                    let ups = by_row.get(&(l, p, Site::Up, n)).cloned().unwrap_or_default();
+                    let gates = by_row.get(&(l, p, Site::Gate, n)).cloned().unwrap_or_default();
+                    // a = φ·g·u split symmetrically (gate atoms × φu/2, up atoms × φg/2) – or φ·u without a gate
+                    let (kg, ku, rest_a) = if lg.gated {
+                        let gv = li.gate[p * ff + n as usize];
+                        let phi = ratio(f, gv);
+                        let (kg, ku) = (phi * 0.5 * uv, phi * 0.5 * gv);
+                        (kg, ku, kg * cx.row_ablated(l, p, Site::Gate, n) + ku * (cx.row_ablated(l, p, Site::Up, n) + cx.bias(l, Site::Up, n as usize)))
+                    } else {
+                        let ku = ratio(f, uv);
+                        (0.0, ku, ku * (cx.row_ablated(l, p, Site::Up, n) + cx.bias(l, Site::Up, n as usize)))
+                    };
+                    let mut by_src: HashMap<String, f32> = HashMap::new();
+                    let mut singles: Vec<(String, f32)> = Vec::new();
+                    for (list, kk2) in [(&gates, kg), (&ups, ku)] {
+                        for &t in list.iter() {
+                            singles.push((atoms[t].name(), kk2 * infos[t].value));
+                            for s2 in &infos[t].sources {
+                                *by_src.entry(src_name(s2.from)).or_insert(0.0) += kk2 * s2.c;
+                            }
+                            for (name, r) in &infos[t].rest {
+                                *by_src.entry(rest_name(name, p)).or_insert(0.0) += kk2 * r;
+                            }
+                        }
+                    }
+                    *by_src.entry(format!("switched-off gate/up atoms and bias of this neuron [{p}]")).or_insert(0.0) += rest_a;
+                    let parts = sorted(by_src);
+                    let tot: f32 = parts.iter().map(|x| x.1).sum();
+                    why_dev = why_dev.max(cx.check(tot, a_v, parts.iter().map(|x| x.1.abs()).sum(), || format!("why-split of {}", u.name())));
+                    singles.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                    md += &format!("- why it fires: a = {a_v:+.3} = {} …\n", fmt_parts(&parts, 5));
+                    md += &format!("  - strongest single multiplications: {}\n", fmt_parts(&singles, 4));
+                    steps_json[steps_len - 1]["why"] = json!({"activation": a_v, "by_source": parts.iter().take(12).map(|(n2, v)| json!({"source": n2, "share": v})).collect::<Vec<_>>(),
+                        "strongest_multiplications": singles.iter().take(12).map(|(n2, v)| json!({"atom": n2, "share": v})).collect::<Vec<_>>()});
+                }
+                Unit::Head { h, .. } => {
+                    let lg = &g.layers[l];
+                    let nh = lg.nh;
+                    let sc = m.blocks[l].attn.scale;
+                    let pr = &li.probs[(p * nh + h) * t..(p * nh + h + 1) * t];
+                    let mut ks: Vec<usize> = g.keys(l, p).collect();
+                    ks.sort_by(|a, b| pr[*b].partial_cmp(&pr[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                    // check: the scores as split here, through scale, softcap and softmax, give the weights the model used
+                    {
+                        let gr = h / (nh / lg.nkv);
+                        let hbc = cx.cell(l, p).heads.get(h);
+                        let score_of = |j: usize| -> f32 {
+                            let (qv, kv) = (&li.q[p * nh * lg.hd + h * lg.hd..][..lg.hd], &li.k[j * lg.nkv * lg.hd + gr * lg.hd..][..lg.hd]);
+                            let raw: f32 = match (hbc, cx.pm(l, p), cx.pm(l, j)) {
+                                (Some(hb), Some(pq), Some(pk)) => (0..lg.hd).map(|x| if hb.qk.atom_on(j as u32, x as u32) { qv[x] * kv[x] } else { pq.q[h * lg.hd + x] * pk.k[gr * lg.hd + x] }).sum(),
+                                (Some(hb), None, _) => (0..lg.hd).filter(|&x| hb.qk.atom_on(j as u32, x as u32)).map(|x| qv[x] * kv[x]).sum(),
+                                _ => qv.iter().zip(kv).map(|(a, b)| a * b).sum(),
+                            };
+                            let mut z = raw * sc;
+                            if let Some(cap) = m.blocks[l].attn.softcap {
+                                z = (z / cap).tanh() * cap;
+                            }
+                            z
+                        };
+                        let keys: Vec<usize> = g.keys(l, p).collect();
+                        let zs: Vec<f32> = keys.iter().map(|&j| score_of(j)).collect();
+                        let mx = zs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let den: f32 = zs.iter().map(|z| (z - mx).exp()).sum();
+                        for (jj, &j) in keys.iter().enumerate() {
+                            why_dev = why_dev.max(cx.check((zs[jj] - mx).exp() / den, pr[j], 1.0, || format!("attention weight of {} on [{j}]", u.name())));
+                        }
+                    }
+                    let mut whys = Vec::new();
+                    for &j in ks.iter().take(3) {
+                        // the score of key j: its products q_e·k_e (on: real, off: their means), split over the
+                        // sources of the key (q held fixed) and of the query (k held fixed)
+                        let mut kside: HashMap<String, f32> = HashMap::new();
+                        let mut qside: HashMap<String, f32> = HashMap::new();
+                        let mut on_sum = 0f32;
+                        for &qa in qk_by.get(&(l, p, h, j)).map(|v| &v[..]).unwrap_or(&[]) {
+                            on_sum += infos[qa].value;
+                            for s2 in &infos[qa].sources {
+                                let side = if s2.via.starts_with('k') { &mut kside } else { &mut qside };
+                                *side.entry(src_name(s2.from)).or_insert(0.0) += sc * s2.c;
+                            }
+                            for (name, r) in &infos[qa].rest {
+                                let (side, pos) = if name.starts_with("k:") { (&mut kside, j) } else { (&mut qside, p) };
+                                *side.entry(rest_name(name, pos)).or_insert(0.0) += sc * r;
+                            }
+                        }
+                        let gr = h / (nh / lg.nkv);
+                        let (qv, kv) = (&li.q[p * nh * lg.hd + h * lg.hd..][..lg.hd], &li.k[j * lg.nkv * lg.hd + gr * lg.hd..][..lg.hd]);
+                        let raw: f32 = qv.iter().zip(kv).map(|(a, b)| a * b).sum();
+                        // with every product on, raw is the score; the switched-off products count with their means
+                        let off_part = match (cx.pm(l, p), cx.pm(l, j), cx.cell(l, p).heads.get(h)) {
+                            (Some(pq), Some(pk), Some(hb)) => (0..lg.hd).filter(|&x| !hb.qk.atom_on(j as u32, x as u32)).map(|x| pq.q[h * lg.hd + x] * pk.k[gr * lg.hd + x]).sum::<f32>(),
+                            (None, _, Some(hb)) => { let _ = hb; 0.0 }
+                            _ => 0.0,
+                        };
+                        let hb_cut = cx.cell(l, p).heads.get(h).is_some_and(|hb| !hb.qk.is_empty());
+                        let score = sc * if hb_cut { on_sum + off_part } else { raw };
+                        let kparts = sorted(kside);
+                        let qparts = sorted(qside);
+                        md += &format!(
+                            "- why it looks at [{j}] {:?} ({:.0}%): score {score:+.3} (switched-off products {:+.3}) · key side: {} · query side: {}\n",
+                            m.tok.piece(e.ids[j]),
+                            pr[j] * 100.0,
+                            sc * off_part * f32::from(u8::from(hb_cut)),
+                            fmt_parts(&kparts, 3),
+                            fmt_parts(&qparts, 3)
+                        );
+                        whys.push(json!({"key": j, "token": m.tok.piece(e.ids[j]), "weight": pr[j], "score": score,
+                            "key_side": kparts.iter().take(8).map(|(n2, v)| json!({"source": n2, "share": v})).collect::<Vec<_>>(),
+                            "query_side": qparts.iter().take(8).map(|(n2, v)| json!({"source": n2, "share": v})).collect::<Vec<_>>()}));
+                    }
+                    steps_json[steps_len - 1]["why"] = json!(whys);
+                }
+                _ => {}
+            }
+            if let Some(o) = off {
+                md += &format!("- switched off alone: {:?} {:.0}% (KL {:.3})\n", m.tok.piece(o.top[0].0), o.top[0].1 * 100.0, o.kl);
+            }
+            md += "\n";
+        }
+        if small > 0 {
+            md += &format!("({small} more steps pass on less than 0.5% of the margin each; all of them are in steps.json, and every multiplication in atoms_in_order.jsonl.)\n\n");
+        }
+        md += &format!("## The end\n\n{tgt} {:.3} − {riv} {:.3} = {:+.3}: the sum of every root and every step's direct part, exact to {:.1e}. Every neuron's activation is the sum of its why-parts, and every head's weights follow from its split scores, exact to {:.1e}.\n", fl.logits[0], fl.logits[1], total, fl.dev_roots, why_dev);
+        std::fs::write(dir.join("steps.md"), md).map_err(|x| format!("{}: {x}", dir.display()))?;
+        write_json(dir, "steps.json", &json!({"what": "every unit of the circuit in the order the model computes it, with what it reads, what it passes on of the margin target − rival (exact), and what its contribution raises and lowers over the whole vocabulary", "margin": total, "steps": steps_json}))?;
+    }
+    // ------------------------------------------------------------ bias rows of the neurons that carry the most flow
+    let mut bias_list: Vec<Value> = Vec::new();
+    if let (Some(nb), true) = (r.o.bias, !unit_out.is_empty()) {
+        let mut ns: Vec<(Unit, f32)> = unit_out.iter().filter(|(u, _)| matches!(u, Unit::Neuron { .. })).map(|(u, v)| (*u, diff(v))).collect();
+        ns.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen: BTreeSet<(usize, u32)> = BTreeSet::new();
+        let trb = crate::bias::record(m, e.ids, focus);
+        let bdir = dir.join("bias");
+        std::fs::create_dir_all(&bdir).map_err(|x| format!("{}: {x}", bdir.display()))?;
+        for (u, fl_diff) in ns.iter() {
+            if seen.len() >= nb {
+                break;
+            }
+            if let Unit::Neuron { l, n, .. } = *u {
+                if !seen.insert((l, n)) {
+                    continue;
+                }
+                let v = crate::bias::analyze(m, e.ids, focus, &trb, l, n as usize, &bdir, r.o.bias_top)?;
+                bias_list.push(json!({"neuron": v["neuron"], "folder": format!("bias/{}", v["folder"].as_str().unwrap_or("")), "flow_through_it": fl_diff,
+                    "activation_range": v["repertoire"], "closure": v["checks"]["received_add_up_to_p_and_q"]}));
+            }
+        }
+    }
     // ------------------------------------------------------------ circuit.json and README.md
     let s = &e.st;
     let comps_json: Vec<Value> = {
@@ -1239,13 +1709,15 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             "units": units_sorted,
             "layers": layers_json,
             "atoms_listed": detailed, "atoms_listed_note": if detailed { Value::Null } else { json!(format!("{n_on} atoms are on (more than {MAX_ATOMS}): only units and components are written")) },
-            "checks": {"trace_closure": closure_v, "trace_closure_worst_at": worst_at, "empty_cut_bit_identical": r.empty_identical,
+            "flow": flow_checks,
+            "bias_rows": bias_list,
+            "checks": {"trace_closure": closure_v, "trace_closure_worst_at": worst_at, "flow_worst_deviation": flow_dev, "empty_cut_bit_identical": r.empty_identical,
                 "batch_vs_standalone_dkl": s.batch_dev, "clean_rows_dkl": s.clean_dev, "dead_atoms_output_bit_identical": s.dead_identical,
                 "tests": s.tests, "passes": s.passes, "seconds": s.secs},
         }),
     )?;
     std::fs::write(dir.join("README.md"), README).map_err(|x| format!("{}: {x}", dir.display()))?;
-    Ok(detailed.then_some(closure))
+    Ok(detailed.then_some((closure, flow_dev)))
 }
 
 const README: &str = "# apollon circuit folder
@@ -1258,6 +1730,22 @@ Written by `apollon --circuit` (self-expansion). Open the files from coarse to f
 * `trace.json` – the circuit backwards from the output: for every unit how many links it is away from the
   output, which units it reads and which it feeds (summed exact contributions of the atom edges between
   them), and the atoms that write directly into the target's logit.
+* `flow.json` – the output split over every atom (attention weights, activation ratios and norm scales held
+  at their values, so everything between atoms is linear): the main path from the output back to the
+  tokens, every unit and edge with the exact part of target − rival it carries, the roots (embeddings,
+  switched-off atoms, biases) – all roots together give the logits exactly –, the strongest atoms with the
+  tokens their flow raises and lowers.
+* `steps.md` / `steps.json` – the protocol: every head, K/V group, neuron and PLE dimension of the circuit in
+  the order the model computes it, with what it reads, the exact part of the margin target − rival it
+  passes on, and the tokens its contribution raises and lowers over the whole vocabulary.
+* `atoms_in_order.jsonl` – every multiplication in the order the model computes it (one JSON per line):
+  value, value when off, flow, its strongest sources and the rest.
+* `flows_residual.f32` / `.json` – the matrix: one row per atom, its flow into the stream at the end (float32);
+  any token's part follows from the output matrix and the frozen final norm.
+* `bias/S<l>_<i>/` (with --circuit-bias) – the bias rows of the neurons that carry the most flow: what one unit
+  of each neuron's activation gives every later neuron, Q/K/V projection and token, what every source gives
+  it, the range its activation allows, and at every position what it actually receives and gives (bias.json,
+  full rows as float32).
 * `layers/SLL/layer.json` – one layer: its components and units per position.
 * `layers/SLL/pPP/<attention|kv|mlp|ple>/<unit>.json` – one head, K/V group, neuron or PLE dimension at one
   position with every scalar product that is on in it.
@@ -1276,6 +1764,7 @@ Every atom lists:
 * `closure` – |value − (sources + rest)| relative to the size of the parts; `trace_closure` in circuit.json is
   the largest one over every decomposition (and over the residual stream at every stage);
 * `to_output` – for writers at the focus: their contribution to the target's and the rival's logit;
+* `flow` – what of the output passes through it: onto the target's and the rival's logit (see flow.json);
 * `used_by` – the atoms that read it, with the contribution (the 32 largest; the others in
   `used_by_not_listed`); `used_nonlinearly_by` – the atoms that depend on it through a non-linearity.
 
@@ -1311,4 +1800,361 @@ mod tests {
             }
         }
     }
+}
+
+// ====================================================================== the flow of the output through every atom
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+enum FNode {
+    /// a part that is no atom: embedding, switched-off atoms, biases, norm terms (with the position it enters)
+    Root(String),
+    U(Unit),
+    Output,
+}
+
+struct Flow {
+    /// the tokens followed: target, rival, then the strongest of the union's output
+    toks: Vec<u32>,
+    /// their logits before a softcap, computed directly: W_U · N(x at the end)
+    logits: Vec<f32>,
+    /// per atom its flow onto each token's logit [n][K]
+    atom: Vec<f32>,
+    /// summed flow along every edge: root → unit, unit → unit, unit → output [K]
+    edges: HashMap<(FNode, FNode), Vec<f32>>,
+    /// all roots together, per token, and the largest relative deviation from the logits
+    roots_sum: Vec<f32>,
+    dev_roots: f32,
+    /// every unit: flow in (from roots and other units) = flow out (to other units and the output)
+    dev_units: (f32, String),
+    /// the residual-space matrix [n][d]: the flow of every atom into the stream at the focus (before the final
+    /// norm); all roots plus the atoms' direct parts give that stream exactly. None when too large.
+    matrix: Option<Vec<f32>>,
+    dev_matrix: f32,
+    /// the strongest atoms (by flow onto target − rival) with the tokens their flow raises and lowers most
+    voices: Vec<(usize, Vec<(u32, f32)>, Vec<(u32, f32)>)>,
+    /// every unit: the tokens its outflow raises and lowers most over the whole vocabulary
+    unit_voices: HashMap<Unit, (Vec<(u32, f32)>, Vec<(u32, f32)>)>,
+}
+
+/// the flow matrix is written when atoms × d stays below this many floats
+const MAX_MATRIX: usize = 64 << 20;
+
+#[allow(clippy::too_many_arguments)]
+fn flow_split(atoms: &[A], infos: &[Info], cx: &Ctx, e: &Engine, m: &Model, g: &Geo, tr: &crate::model::Trace, fin: &Snap, fs: f32, fnorm: Option<&Norm>, focus: usize) -> Flow {
+    let d = g.d;
+    let n = atoms.len();
+    let lm = m.lm_head();
+    // the tokens followed
+    let mut toks = vec![e.ys[0], e.ys[1]];
+    if !tr.logits.is_empty() {
+        let mut idx: Vec<usize> = (0..tr.logits.len()).collect();
+        let kk = 24.min(idx.len());
+        idx.select_nth_unstable_by(kk - 1, |a, b| tr.logits[*b].partial_cmp(&tr.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        let mut top = idx[..kk].to_vec();
+        top.sort_by(|a, b| tr.logits[*b].partial_cmp(&tr.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        for i in top {
+            if toks.len() >= 20 {
+                break;
+            }
+            if !toks.contains(&(i as u32)) {
+                toks.push(i as u32);
+            }
+        }
+    }
+    let kk = toks.len();
+    // u_k: how token k's logit (before a softcap) moves with the stream at the focus, the final norm frozen
+    let row_of = |t: u32| -> Vec<f32> {
+        let mut r = vec![0f32; d];
+        lm.row(t as usize, &mut r);
+        r
+    };
+    let mut u = vec![0f32; kk * d];
+    for (ki, &t) in toks.iter().enumerate() {
+        let mut r = row_of(t);
+        if let Some(nm) = fnorm {
+            for c in 0..d {
+                r[c] *= fs * nm.w[c];
+            }
+            if !nm.rms {
+                let mu = r.iter().map(|x| *x as f64).sum::<f64>() as f32 / d as f32;
+                r.iter_mut().for_each(|v| *v -= mu);
+            }
+        }
+        u[ki * d..(ki + 1) * d].copy_from_slice(&r);
+    }
+    let mut hfin = fin.x.clone();
+    if let Some(nm) = fnorm {
+        nm.apply_scale(&fin.x, &mut hfin, fs);
+    }
+    let logits: Vec<f32> = toks.iter().map(|&t| row_of(t).iter().zip(&hfin).map(|(a, b)| a * b).sum()).collect();
+    // later stages first: every source of an atom comes earlier
+    let key = |a: &A| -> (usize, u8) {
+        match *a {
+            A::W { l, s, .. } => (
+                l,
+                match s {
+                    Site::Q | Site::K | Site::V => 0,
+                    Site::O => 3,
+                    Site::Gate | Site::Up => 4,
+                    Site::Down => 5,
+                    Site::PleIn | Site::PleGate => 6,
+                    Site::PleProj => 7,
+                },
+            ),
+            A::Qk { l, .. } => (l, 1),
+            A::Av { l, .. } => (l, 2),
+        }
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(key(&atoms[i])));
+    // writers at the focus write straight into the stream at the end
+    let direct = |i: usize| -> Option<(usize, f32)> {
+        if let A::W { l, p, s, a: o2, .. } = atoms[i] {
+            let kind = match s {
+                Site::O => 0u8,
+                Site::Down => 1,
+                Site::PleProj => 2,
+                _ => return None,
+            };
+            if p == focus {
+                let sc = cx.visible(Stage::Final, l, kind).unwrap_or(1.0);
+                return Some((o2 as usize, cx.post(l, kind, focus, o2 as usize) * sc));
+            }
+        }
+        None
+    };
+    // the sensitivities, backwards: S_src += k · S_dst over every edge (Q·K products pass nothing on)
+    let back = |dim: usize, init: &dyn Fn(usize, f32, &mut [f32])| -> Vec<f32> {
+        let mut sv = vec![0f32; n * dim];
+        for &i in &order {
+            if let Some((o2, f)) = direct(i) {
+                init(o2, f, &mut sv[i * dim..(i + 1) * dim]);
+            }
+            if matches!(atoms[i], A::Qk { .. }) {
+                continue;
+            }
+            let sd: Vec<f32> = sv[i * dim..(i + 1) * dim].to_vec();
+            if sd.iter().all(|x| *x == 0.0) {
+                continue;
+            }
+            for s in &infos[i].sources {
+                let dst = &mut sv[s.from * dim..(s.from + 1) * dim];
+                for (a, b) in dst.iter_mut().zip(&sd) {
+                    *a += s.k * b;
+                }
+            }
+        }
+        sv
+    };
+    let sk = back(kk, &|o2, f, row| {
+        for ki in 0..kk {
+            row[ki] += f * u[ki * d + o2];
+        }
+    });
+    let pos_of = |a: &A| match *a {
+        A::W { p, .. } | A::Qk { p, .. } | A::Av { p, .. } => p,
+    };
+    // flows, edges, roots
+    let mut atom = vec![0f32; n * kk];
+    let mut edges: HashMap<(FNode, FNode), Vec<f32>> = HashMap::new();
+    let mut add = |a: FNode, b: FNode, f: f32, sv: &[f32]| {
+        let x = edges.entry((a, b)).or_insert_with(|| vec![0f32; kk]);
+        for (p, q) in x.iter_mut().zip(sv) {
+            *p += f * q;
+        }
+    };
+    let mut roots_sum = vec![0f32; kk];
+    let mut roots_abs = vec![0f32; kk];
+    for i in 0..n {
+        if matches!(atoms[i], A::Qk { .. }) {
+            continue;
+        }
+        let si = &sk[i * kk..(i + 1) * kk];
+        for ki in 0..kk {
+            atom[i * kk + ki] = infos[i].value * si[ki];
+        }
+        let ui = FNode::U(atoms[i].unit(g));
+        if let Some((o2, f)) = direct(i) {
+            let sv: Vec<f32> = (0..kk).map(|ki| infos[i].value * f * u[ki * d + o2]).collect();
+            add(ui.clone(), FNode::Output, 1.0, &sv);
+        }
+        for s in &infos[i].sources {
+            let us = FNode::U(atoms[s.from].unit(g));
+            if us != ui {
+                add(us, ui.clone(), s.k * infos[s.from].value, si);
+            }
+        }
+        let pos = pos_of(&atoms[i]);
+        for (name, r) in &infos[i].rest {
+            if *r == 0.0 {
+                continue;
+            }
+            add(FNode::Root(format!("{name} [{pos}]")), ui.clone(), *r, si);
+            for ki in 0..kk {
+                roots_sum[ki] += r * si[ki];
+                roots_abs[ki] += (r * si[ki]).abs();
+            }
+        }
+    }
+    // the parts of the stream at the end that are no atom
+    for (name, part) in [("embedding", &fin.emb), ("switched-off writers", &fin.abl), ("biases of writers", &fin.bias)] {
+        let sv: Vec<f32> = (0..kk).map(|ki| (0..d).map(|c| u[ki * d + c] * part[c]).sum()).collect();
+        if sv.iter().any(|x| *x != 0.0) {
+            add(FNode::Root(format!("{name} [{focus}], straight into the stream at the end")), FNode::Output, 1.0, &sv);
+        }
+        for ki in 0..kk {
+            roots_sum[ki] += sv[ki];
+            roots_abs[ki] += sv[ki].abs();
+        }
+    }
+    if let Some(b) = fnorm.and_then(|nm| nm.b.as_ref()) {
+        let sv: Vec<f32> = toks.iter().map(|&t| row_of(t).iter().zip(b).map(|(a, c)| a * c).sum()).collect();
+        add(FNode::Root("bias of the final norm".into()), FNode::Output, 1.0, &sv);
+        for ki in 0..kk {
+            roots_sum[ki] += sv[ki];
+            roots_abs[ki] += sv[ki].abs();
+        }
+    }
+    let dev_roots = (0..kk).map(|ki| (roots_sum[ki] - logits[ki]).abs() / roots_abs[ki].max(logits[ki].abs()).max(1e-6)).fold(0f32, f32::max);
+    // every unit passes on exactly what it receives
+    let mut flow_in: HashMap<Unit, Vec<f32>> = HashMap::new();
+    let mut flow_out: HashMap<Unit, Vec<f32>> = HashMap::new();
+    for ((a, b), v) in &edges {
+        if let FNode::U(ub) = b {
+            let x = flow_in.entry(*ub).or_insert_with(|| vec![0f32; kk]);
+            x.iter_mut().zip(v).for_each(|(p, q)| *p += q);
+        }
+        if let FNode::U(ua) = a {
+            let x = flow_out.entry(*ua).or_insert_with(|| vec![0f32; kk]);
+            x.iter_mut().zip(v).for_each(|(p, q)| *p += q);
+        }
+    }
+    let mut dev_units = (0f32, String::new());
+    for (un, vin) in &flow_in {
+        let vout = flow_out.get(un).cloned().unwrap_or_else(|| vec![0f32; kk]);
+        for ki in 0..kk {
+            let dev = (vin[ki] - vout[ki]).abs() / vin[ki].abs().max(vout[ki].abs()).max(1e-3 * logits[ki].abs()).max(1e-6);
+            if dev > dev_units.0 {
+                dev_units = (dev, format!("{} ({})", un.name(), m.tok.piece(toks[ki])));
+            }
+        }
+    }
+    // the residual-space matrix
+    let mut unit_voices = HashMap::new();
+    let (matrix, dev_matrix) = if n * d <= MAX_MATRIX {
+        let mut sd = back(d, &|o2, f, row| row[o2] += f);
+        // what flows out of every unit, as a vector in the stream at the end
+        let mut uvec: BTreeMap<Unit, Vec<f32>> = BTreeMap::new();
+        for i in 0..n {
+            if matches!(atoms[i], A::Qk { .. }) {
+                continue;
+            }
+            let ui = atoms[i].unit(g);
+            if let Some((o2, f)) = direct(i) {
+                uvec.entry(ui).or_insert_with(|| vec![0f32; d])[o2] += infos[i].value * f;
+            }
+            for s2 in &infos[i].sources {
+                let us = atoms[s2.from].unit(g);
+                if us != ui {
+                    let w = s2.k * infos[s2.from].value;
+                    let v = uvec.entry(us).or_insert_with(|| vec![0f32; d]);
+                    for c in 0..d {
+                        v[c] += w * sd[i * d + c];
+                    }
+                }
+            }
+        }
+        if !uvec.is_empty() {
+            let units: Vec<Unit> = uvec.keys().copied().collect();
+            let mut x = vec![0f32; units.len() * d];
+            for (r, un) in units.iter().enumerate() {
+                let f = &uvec[un];
+                let out = &mut x[r * d..(r + 1) * d];
+                match fnorm {
+                    Some(nm) => {
+                        let mu = if nm.rms { 0.0 } else { f.iter().map(|v| *v as f64).sum::<f64>() as f32 / d as f32 };
+                        for c in 0..d {
+                            out[c] = (f[c] - mu) * fs * nm.w[c];
+                        }
+                    }
+                    None => out.copy_from_slice(f),
+                }
+            }
+            let lg = lm.matmul(&x, units.len());
+            let vr = lm.rows;
+            for (r, un) in units.iter().enumerate() {
+                let row = &lg[r * vr..(r + 1) * vr];
+                let mut idx: Vec<usize> = (0..vr).collect();
+                idx.sort_by(|a, b| row[*b].partial_cmp(&row[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                let up: Vec<(u32, f32)> = idx[..6].iter().map(|&t| (t as u32, row[t])).collect();
+                let down: Vec<(u32, f32)> = idx[vr - 6..].iter().rev().map(|&t| (t as u32, row[t])).collect();
+                unit_voices.insert(*un, (up, down));
+            }
+        }
+        let mut rsum = vec![0f64; d];
+        let mut rabs = vec![0f64; d];
+        for i in 0..n {
+            if matches!(atoms[i], A::Qk { .. }) {
+                sd[i * d..(i + 1) * d].iter_mut().for_each(|x| *x = 0.0);
+                continue;
+            }
+            for (name, r) in &infos[i].rest {
+                let _ = name;
+                for c in 0..d {
+                    let v = (*r * sd[i * d + c]) as f64;
+                    rsum[c] += v;
+                    rabs[c] += v.abs();
+                }
+            }
+            let val = infos[i].value;
+            sd[i * d..(i + 1) * d].iter_mut().for_each(|x| *x *= val);
+        }
+        let mut dev = 0f32;
+        for c in 0..d {
+            let tot = rsum[c] + (fin.emb[c] + fin.abl[c] + fin.bias[c]) as f64;
+            let sc = rabs[c] + (fin.emb[c].abs() + fin.abl[c].abs() + fin.bias[c].abs()) as f64;
+            dev = dev.max(((tot - fin.x[c] as f64).abs() / sc.max(fin.x[c].abs() as f64).max(1e-6)) as f32);
+        }
+        (Some(sd), dev)
+    } else {
+        (None, 0.0)
+    };
+    // the strongest atoms: what their flow does to every token of the vocabulary
+    let mut voices = Vec::new();
+    if let Some(mx) = &matrix {
+        let mut by: Vec<usize> = (0..n).filter(|&i| !matches!(atoms[i], A::Qk { .. })).collect();
+        by.sort_by(|&a, &b| {
+            let da = (atom[a * kk] - atom[a * kk + 1]).abs();
+            let db = (atom[b * kk] - atom[b * kk + 1]).abs();
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        by.truncate(40);
+        let mut x = vec![0f32; by.len() * d];
+        for (r, &i) in by.iter().enumerate() {
+            let f = &mx[i * d..(i + 1) * d];
+            let out = &mut x[r * d..(r + 1) * d];
+            match fnorm {
+                Some(nm) => {
+                    let mu = if nm.rms { 0.0 } else { f.iter().map(|v| *v as f64).sum::<f64>() as f32 / d as f32 };
+                    for c in 0..d {
+                        out[c] = (f[c] - mu) * fs * nm.w[c];
+                    }
+                }
+                None => out.copy_from_slice(f),
+            }
+        }
+        if !by.is_empty() {
+            let lg = lm.matmul(&x, by.len());
+            let vr = lm.rows;
+            for (r, &i) in by.iter().enumerate() {
+                let row = &lg[r * vr..(r + 1) * vr];
+                let mut idx: Vec<usize> = (0..vr).collect();
+                idx.sort_by(|a, b| row[*b].partial_cmp(&row[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                let up: Vec<(u32, f32)> = idx[..6].iter().map(|&t| (t as u32, row[t])).collect();
+                let down: Vec<(u32, f32)> = idx[vr - 6..].iter().rev().map(|&t| (t as u32, row[t])).collect();
+                voices.push((i, up, down));
+            }
+        }
+    }
+    Flow { toks, logits, atom, edges, roots_sum, dev_roots, dev_units, matrix, dev_matrix, voices, unit_voices }
 }
