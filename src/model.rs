@@ -605,6 +605,7 @@ impl Cut {
 #[allow(clippy::too_many_arguments)]
 fn cut_rows(y: &mut [f32], x: &[f32], t: usize, ny: usize, cut: Option<&Cut>, l: usize, s: Site, map: impl Fn(usize) -> usize + Sync) {
     let Some(c) = cut else { return };
+    let _pg = crate::prof::time(crate::prof::CUT);
     let nx = x.len() / t;
     y[..t * ny].par_chunks_mut(ny).enumerate().for_each(|(i, yi)| {
         let Some(mc) = c.site(i, l, s) else { return };
@@ -641,6 +642,7 @@ fn cut_rows(y: &mut [f32], x: &[f32], t: usize, ny: usize, cut: Option<&Cut>, l:
 /// None: nothing to do.
 fn cut_cols_in(x: &[f32], t: usize, cut: Option<&Cut>, l: usize, s: Site) -> Option<Vec<f32>> {
     let c = cut?;
+    let _pg = crate::prof::time(crate::prof::CUT);
     if !(0..t).any(|i| c.site(i, l, s).is_some()) {
         return None;
     }
@@ -668,6 +670,7 @@ fn cut_cols_in(x: &[f32], t: usize, cut: Option<&Cut>, l: usize, s: Site) -> Opt
 #[allow(clippy::too_many_arguments)]
 fn cut_cols_out(y: &mut [f32], x: &[f32], t: usize, nout: usize, ny: usize, cut: Option<&Cut>, l: usize, s: Site, idx: impl Fn(usize, usize) -> usize + Sync) {
     let Some(c) = cut else { return };
+    let _pg = crate::prof::time(crate::prof::CUT);
     let nx = x.len() / t;
     y[..t * ny].par_chunks_mut(ny).enumerate().for_each(|(i, yi)| {
         let Some(mc) = c.site(i, l, s) else { return };
@@ -785,9 +788,9 @@ pub fn top_probs(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     let z: f64 = logits.iter().map(|v| ((v - mx) as f64).exp()).sum();
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     let k = k.min(idx.len());
-    idx.select_nth_unstable_by(k.saturating_sub(1), |a, b| logits[*b].partial_cmp(&logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.select_nth_unstable_by(k.saturating_sub(1), |a, b| logits[*b].total_cmp(&logits[*a]));
     let mut top: Vec<(u32, f32)> = idx[..k].iter().map(|&i| (i as u32, (((logits[i] - mx) as f64).exp() / z) as f32)).collect();
-    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    top.sort_by(|a, b| b.1.total_cmp(&a.1));
     top
 }
 
@@ -852,6 +855,7 @@ impl Model {
         &self, l: usize, h: &[f32], t: usize, focus: usize, kv_store: &[Option<(Vec<f32>, Vec<f32>)>], atoms: bool, var: Option<&Variants>, rec_rows: &[usize],
         cut: Option<&Cut>, record: bool, fz: Option<&LayerNorms>,
     ) -> AttnOut {
+        let _pg = crate::prof::time(crate::prof::ATTN);
         let a = &self.blocks[l].attn;
         let posi = |i: usize| var.map_or(i, |v| v.pos[i]);
         // visible rows for row i: two half-open ranges
@@ -1148,6 +1152,7 @@ impl Model {
     }
 
     pub fn run(&self, ids: &[u32], focus: usize, o: &RunOpts) -> Trace {
+        let _pg = crate::prof::time(crate::prof::RUN);
         let (t, d) = (ids.len(), self.d);
         // ablations at single rows
         let (mut attn_at, mut mlp_at, mut ple_at) = (Vec::new(), Vec::new(), Vec::new());

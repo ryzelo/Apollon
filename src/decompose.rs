@@ -89,7 +89,7 @@ fn add(a: &mut [f32], b: &[f32]) {
 }
 
 fn by_abs_desc(a: f32, b: f32) -> std::cmp::Ordering {
-    b.abs().partial_cmp(&a.abs()).unwrap_or(std::cmp::Ordering::Equal)
+    b.abs().total_cmp(&a.abs())
 }
 
 // ------------------------------------------------------------------ preselection
@@ -174,7 +174,7 @@ fn effect(z: &[f32], logz: f64, z2: &[f32], l: &[f32], ys: &[u32]) -> Effect {
             ((p - p2).abs() >= 5e-4).then_some((t as u32, p2, p))
         })
         .collect();
-    dp.sort_by(|a, b| (b.2 - b.1).partial_cmp(&(a.2 - a.1)).unwrap_or(std::cmp::Ordering::Equal));
+    dp.sort_by(|a, b| (b.2 - b.1).total_cmp(&(a.2 - a.1)));
     let gains: Vec<_> = dp.iter().take(K).filter(|x| x.2 > x.1).cloned().collect();
     let losses: Vec<_> = dp.iter().rev().take(K).filter(|x| x.2 < x.1).cloned().collect();
     let mut dlo = [0f32; NY];
@@ -404,7 +404,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
                     let df: Vec<f32> = s.iter().zip(hv).map(|(a, b)| a - b).collect();
                     source_dev = source_dev.max(norm(&df) / nh_);
                 }
-                js.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                js.sort_by(|a, b| b.1.total_cmp(&a.1));
                 let mut rest = hv.to_vec();
                 for &(j, _) in js.iter().take(kq) {
                     let q = &at[(j * nh + h) * d..][..d];
@@ -439,7 +439,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
                 (i, pre.strength(&lg))
             })
             .collect();
-        nv.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        nv.sort_by(|a, b| b.1.total_cmp(&a.1));
         let sel: Vec<usize> = nv.iter().take(kq).map(|x| x.0).collect();
         let cols = columns(&b.mlp.down, &sel);
         let mut rest = tr.focus_mlp[l].clone();
@@ -493,7 +493,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
                     cand.push((t, (val as f64 - s.lse_without).exp() as f32, p[t as usize]));
                 }
             }
-            cand.sort_by(|a, b| (b.2 - b.1).partial_cmp(&(a.2 - a.1)).unwrap_or(std::cmp::Ordering::Equal));
+            cand.sort_by(|a, b| (b.2 - b.1).total_cmp(&(a.2 - a.1)));
             let raises: Vec<_> = cand.iter().take(3).filter(|x| x.2 - x.1 > 5e-4).cloned().collect();
             let lowers: Vec<_> = cand.iter().rev().take(3).filter(|x| x.1 - x.2 > 5e-4).cloned().collect();
             (raises, lowers)
@@ -726,7 +726,7 @@ fn head_targets(c: &Ctx, l: usize, h: usize) -> Vec<(usize, f32)> {
     let pf = &c.tr.attn_focus[l];
     let tt = c.ids.len();
     let mut js: Vec<(usize, f32)> = (0..tt).map(|j| (j, pf[h * tt + j])).filter(|x| x.1 > 0.0).collect();
-    js.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    js.sort_by(|a, b| b.1.total_cmp(&a.1));
     js
 }
 
@@ -821,7 +821,7 @@ fn terminal(c: &Ctx, st: &Style) {
     // summary
     let ab: Vec<usize> = (0..c.changes.len()).filter(|&k| c.parts.parts[c.changes[k]].kind != Kind::FinalBias).collect();
     let mut by_total = ab.clone();
-    by_total.sort_by(|a, b| total_strength(e, *b).partial_cmp(&total_strength(e, *a)).unwrap_or(std::cmp::Ordering::Equal));
+    by_total.sort_by(|a, b| total_strength(e, *b).total_cmp(&total_strength(e, *a)));
     let mut by_direct = ab.clone();
     by_direct.sort_by(|a, b| by_abs_desc(e.voices[c.changes[*a]].dlo[0], e.voices[c.changes[*b]].dlo[0]));
     let list = |v: &[usize], f: &dyn Fn(usize) -> String| v.iter().map(|&k| format!("{} ({})", name(m, c.ids, &c.parts.parts[c.changes[k]]), f(k))).collect::<Vec<_>>().join(" · ");

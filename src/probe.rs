@@ -435,21 +435,21 @@ fn head_shifts(e: &Outcome, base: &Outcome, n_later: usize, t: usize) -> Vec<(us
             kd.push((s, hh, tv));
         }
     }
-    kd.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    kd.sort_by(|a, b| b.2.total_cmp(&a.2));
     kd
 }
 
 /// later neurons whose change moves the lead of y0 over y1 the most: (neuron, contribution)
 fn neuron_shifts(ti: &DeepLayer, t0: &DeepLayer, w: &[f32]) -> Vec<(usize, f32)> {
     let mut nv: Vec<(usize, f32)> = (0..w.len()).map(|n| (n, (ti.act[n] - t0.act[n]) * w[n])).collect();
-    nv.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    nv.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
     nv
 }
 
 /// strongest positions a head looks at
 fn gaze(pr: &[f32], hh: usize, t: usize, n: usize) -> Vec<(usize, f32)> {
     let mut js: Vec<(usize, f32)> = (0..t).map(|j| (j, pr[hh * t + j])).collect();
-    js.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    js.sort_by(|a, b| b.1.total_cmp(&a.1));
     js.truncate(n);
     js
 }
@@ -541,7 +541,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, contrast: 
     let all_off = by_pos_all[focus + 1].clone();
     let only_here: Vec<Outcome> = by_pos_all[focus + 2..].to_vec();
     let mut pos_rank: Vec<usize> = (0..=focus).collect();
-    pos_rank.sort_by(|a, b| by_pos[*a].dlo(0).partial_cmp(&by_pos[*b].dlo(0)).unwrap_or(std::cmp::Ordering::Equal));
+    pos_rank.sort_by(|a, b| by_pos[*a].dlo(0).total_cmp(&by_pos[*b].dlo(0)));
     let best = pos_rank[0];
     // distributed: no single position carries even half of the effect -> units at all positions at once
     let distributed = o.pos.is_none() && by_pos[best].dlo(0).abs() < 0.5 * all_off.dlo(0).abs();
@@ -566,7 +566,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, contrast: 
         // preselect by size of the contribution over all positions: Σ_p |a_p| · ‖W_down[:, u]‖
         let cn = b.mlp.col_norms();
         let sc = |u: usize| -> f32 { qs.iter().map(|&p| values[p * nu + u].abs()).sum::<f32>() * cn[u] };
-        cand.sort_by(|a, b| sc(*b).partial_cmp(&sc(*a)).unwrap_or(std::cmp::Ordering::Equal));
+        cand.sort_by(|a, b| sc(*b).total_cmp(&sc(*a)));
         preselected = Some(cand.len());
         cand.truncate(o.max);
     }
@@ -576,11 +576,11 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, contrast: 
     let brute = runner.compute(&vars, false, "stage 2 (brute force)");
     let secs_brute = t2.elapsed().as_secs_f32();
     let mut rank: Vec<usize> = (0..units.len()).collect();
-    rank.sort_by(|a, b| brute[*b].dlo(0).abs().partial_cmp(&brute[*a].dlo(0).abs()).unwrap_or(std::cmp::Ordering::Equal));
+    rank.sort_by(|a, b| brute[*b].dlo(0).abs().total_cmp(&brute[*a].dlo(0).abs()));
 
     // ---- 3. interplay: first those whose absence weakens the target the most
     let mut supports: Vec<usize> = (0..units.len()).collect();
-    supports.sort_by(|a, b| brute[*a].dlo(0).partial_cmp(&brute[*b].dlo(0)).unwrap_or(std::cmp::Ordering::Equal));
+    supports.sort_by(|a, b| brute[*a].dlo(0).total_cmp(&brute[*b].dlo(0)));
     let n_act = supports.len();
     let mut ks: Vec<usize> = Vec::new();
     let mut k = 1;
@@ -1002,7 +1002,7 @@ fn terminal(r: &Report, st: &Style) {
     }
     println!("     {} {}", pad("all positions", 16), res_txt(r.all_off));
     let mut rescue: Vec<usize> = (0..=r.focus).collect();
-    rescue.sort_by(|a, b| r.only_here[*b].dlo(0).partial_cmp(&r.only_here[*a].dlo(0)).unwrap_or(std::cmp::Ordering::Equal));
+    rescue.sort_by(|a, b| r.only_here[*b].dlo(0).total_cmp(&r.only_here[*a].dlo(0)));
     println!(
         "     {} {}",
         st.dim("off everywhere except at one position – where it rescues the most on its own:"),
@@ -1086,7 +1086,7 @@ fn terminal(r: &Report, st: &Style) {
                 ch.push((s, comp, r.comp(vi, s, comp).dlo[0] - r.comp(n_id, s, comp).dlo[0]));
             }
         }
-        ch.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        ch.sort_by(|a, b| b.2.abs().total_cmp(&a.2.abs()));
         for &(s, comp, _) in ch.iter().take(4) {
             let (a0, a1) = (r.comp(n_id, s, comp), r.comp(vi, s, comp));
             let name = format!("S{} {}", r.l + s, ["attention", "MLP", "PLE"][comp]);

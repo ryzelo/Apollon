@@ -123,7 +123,7 @@ pub fn analyze(m: &Model, ids: &[u32], focus: usize, tr: &Trace, l: usize, i: us
     let top_in = |kind: &str| -> Vec<Value> {
         let Some((_, arrows)) = inputs.kinds.iter().find(|(k, _)| *k == kind) else { return Vec::new() };
         let mut v: Vec<&crate::neuron::Arrow> = arrows.iter().collect();
-        v.sort_by(|a, b| (b.p.abs() + b.q.abs()).partial_cmp(&(a.p.abs() + a.q.abs())).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(|a, b| (b.p.abs() + b.q.abs()).total_cmp(&(a.p.abs() + a.q.abs())));
         v.iter().take(top).map(|a| json!({"source": src_name(m, &a.src), "dp": a.p, "dq": a.q})).collect()
     };
     // ------------------------------------------------------------ the bias row: what it can give every later part
@@ -191,10 +191,10 @@ pub fn analyze(m: &Model, ids: &[u32], focus: usize, tr: &Trace, l: usize, i: us
         [a.min(b), a.max(b)]
     };
     let mut outs: Vec<&crate::neuron::Arrow> = outputs.neurons.iter().collect();
-    outs.sort_by(|a, b| (b.p.abs() + b.q.abs()).partial_cmp(&(a.p.abs() + a.q.abs())).unwrap_or(std::cmp::Ordering::Equal));
+    outs.sort_by(|a, b| (b.p.abs() + b.q.abs()).total_cmp(&(a.p.abs() + a.q.abs())));
     let top_out: Vec<Value> = outs.iter().take(top).map(|a| json!({"target": src_name(m, &a.src), "dp": a.p, "dq": a.q, "dp_range": range(a.p), "dq_range": range(a.q)})).collect();
     let mut vo: Vec<(u32, f32)> = outputs.voice.clone();
-    vo.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    vo.sort_by(|a, b| b.1.total_cmp(&a.1));
     let voice_top = |rev: bool| -> Vec<Value> {
         let it: Box<dyn Iterator<Item = &(u32, f32)>> = if rev { Box::new(vo.iter().rev()) } else { Box::new(vo.iter()) };
         it.take(top.min(20)).map(|(t2, x)| json!({"token": m.tok.piece(*t2), "logit": x, "range": range(*x as f64)})).collect()
@@ -296,7 +296,7 @@ pub fn analyze(m: &Model, ids: &[u32], focus: usize, tr: &Trace, l: usize, i: us
                 None => groups.push((x.1, x.2, x.3)),
             }
         }
-        recv.sort_by(|a, b| (b.2.abs() + b.3.abs()).partial_cmp(&(a.2.abs() + a.3.abs())).unwrap_or(std::cmp::Ordering::Equal));
+        recv.sort_by(|a, b| (b.2.abs() + b.3.abs()).total_cmp(&(a.2.abs() + a.3.abs())));
         // what it gives at this position: its activation times the row, with the targets' scales
         let mut give: Vec<(String, f64, f64, f64)> = Vec::new();
         let mut cur = usize::MAX;
@@ -314,7 +314,7 @@ pub fn analyze(m: &Model, ids: &[u32], focus: usize, tr: &Trace, l: usize, i: us
                 give.push((format!("S{k} #{c}"), dp, dq, target_p));
             }
         }
-        give.sort_by(|a, b| (b.1.abs() + b.2.abs()).partial_cmp(&(a.1.abs() + a.2.abs())).unwrap_or(std::cmp::Ordering::Equal));
+        give.sort_by(|a, b| (b.1.abs() + b.2.abs()).total_cmp(&(a.1.abs() + a.2.abs())));
         cases.push(json!({
             "position": p, "token": m.tok.piece(ids[p]), "scale": s,
             "p": p_rec, "q": if gated { json!(q_rec) } else { Value::Null }, "activation": a_rec,
@@ -330,7 +330,7 @@ pub fn analyze(m: &Model, ids: &[u32], focus: usize, tr: &Trace, l: usize, i: us
             let sc = scale_at(ns, focus);
             let f = ns.fin.get(focus).copied().unwrap_or(1.0) as f64 * runtime_factor(&ops, &sc) * inp[l].act[focus * ff + i] as f64;
             let mut v: Vec<(u32, f64)> = outputs.voice.iter().map(|(t2, x)| (*t2, f * *x as f64)).collect();
-            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
             json!({"raises": v.iter().take(10).map(|(t2, x)| json!({"token": m.tok.piece(*t2), "logit": x})).collect::<Vec<_>>(),
                 "lowers": v.iter().rev().take(10).map(|(t2, x)| json!({"token": m.tok.piece(*t2), "logit": x})).collect::<Vec<_>>()})
         }

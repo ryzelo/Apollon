@@ -376,7 +376,7 @@ pub fn static_vs_runtime(m: &Model, tr: &Trace, ids: &[u32], focus: usize, rt: &
     let rp = ReadPoint::MlpIn(l);
     let sc = scale_of(tr);
     let mut ranked: Vec<&Contrib> = rt.parts.iter().filter(|c| matches!(c.src, Src::Neuron(..) | Src::Token(_) | Src::Position(_) | Src::PleDim(..))).collect();
-    ranked.sort_by(|a, b| (b.p.abs() + b.q.abs()).partial_cmp(&(a.p.abs() + a.q.abs())).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| (b.p.abs() + b.q.abs()).total_cmp(&(a.p.abs() + a.q.abs())));
     let mut worst = 0f64;
     for c in ranked.into_iter().take(n) {
         let ops = path(m, c.src, rp, true).unwrap();
@@ -420,7 +420,7 @@ pub fn level01(m: &Model, rt: &Runtime, v: &[f32], gate: bool) -> Vec<(usize, f6
 
 pub fn top_abs(v: &[(usize, f64)], n: usize) -> (Vec<(usize, f64)>, f64) {
     let mut s = v.to_vec();
-    s.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    s.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
     let rest: f64 = s.iter().skip(n).map(|x| x.1).sum();
     s.truncate(n);
     (s, rest)
@@ -586,12 +586,12 @@ fn auto_start(m: &Model, tr: &Trace, fr: &Frame, y0: u32, n: usize) -> Vec<(usiz
             cand.push((l, i, a * f * w[i]));
         }
     }
-    cand.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    cand.sort_by(|a, b| b.2.abs().total_cmp(&a.2.abs()));
     cand.truncate((4 * n).max(32));
     let ids: Vec<(usize, usize)> = cand.iter().map(|x| (x.0, x.1)).collect();
     let exact = direct_voices(m, tr, fr, &ids, &[y0]);
     let mut out: Vec<(usize, usize, f32)> = ids.iter().zip(&exact).map(|(&(l, i), &v)| (l, i, v)).collect();
-    out.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| b.2.abs().total_cmp(&a.2.abs()));
     out.truncate(n);
     out
 }
@@ -839,7 +839,7 @@ impl<'a> Zoom<'a> {
     }
     fn ranked(&self, parts: &[Contrib], u: &Units) -> Vec<(Src, f64)> {
         let mut r: Vec<(Src, f64)> = parts.iter().filter(|c| c.src != Src::Offset).map(|c| (c.src, u.a(c.p, c.q))).collect();
-        r.sort_by(|x, y| y.1.abs().partial_cmp(&x.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        r.sort_by(|x, y| y.1.abs().total_cmp(&x.1.abs()));
         r.truncate(self.top);
         r
     }
@@ -861,7 +861,7 @@ impl<'a> Zoom<'a> {
                             _ => None,
                         })
                         .collect();
-                    at.sort_by(|x, y| y.1.abs().partial_cmp(&x.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                    at.sort_by(|x, y| y.1.abs().total_cmp(&x.1.abs()));
                     at.truncate(self.top);
                     let mut atoms = Vec::new();
                     for (n, (j, a_j)) in at.into_iter().enumerate() {
@@ -1009,7 +1009,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
         let direct = direct_voices(m, &tr, &fr, &[(l, i)], &[y0])[0];
         // removals: the neuron itself, and the strongest sources only from this neuron
         let mut ranked: Vec<Contrib> = rt.parts.iter().filter(|c| c.src != Src::Offset).cloned().collect();
-        ranked.sort_by(|a, b| rt.a_of(b).abs().partial_cmp(&rt.a_of(a).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| rt.a_of(b).abs().total_cmp(&rt.a_of(a).abs()));
         ranked.truncate(o.top.max(6));
         let mut removals: Vec<Removal> = Vec::new();
         for c in &ranked {
@@ -1165,7 +1165,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
         // the strongest atom from layer 1 on (there the read position carries heads and neurons, not only the embedding)
         let later: Vec<&Contrib> = rt.atoms.iter().filter(|c| matches!(c.src, Src::Atom(k, _, _) if k >= 1)).collect();
         let pool: Vec<&Contrib> = if later.is_empty() { rt.atoms.iter().collect() } else { later };
-        if let Some(c) = pool.into_iter().max_by(|a, b| rt.a_of(a).abs().partial_cmp(&rt.a_of(b).abs()).unwrap_or(std::cmp::Ordering::Equal)) {
+        if let Some(c) = pool.into_iter().max_by(|a, b| rt.a_of(a).abs().total_cmp(&rt.a_of(b).abs())) {
             if let Src::Atom(k, h, jj) = c.src {
                 let reader = Reader { pos: focus, rp: ReadPoint::MlpIn(rt.rd.l), rg: rt.rd.g.clone(), ru: if rt.rd.gated { Some(rt.rd.u.clone()) } else { None }, scale: rt.s };
                 let tj = zoomer.trace_at(jj as usize);
@@ -1217,7 +1217,7 @@ fn groups(rt: &Runtime) -> Vec<(&'static str, f64, f64, f64, usize)> {
 
 fn ranked_sources(rt: &Runtime) -> Vec<&Contrib> {
     let mut r: Vec<&Contrib> = rt.parts.iter().collect();
-    r.sort_by(|a, b| rt.a_of(b).abs().partial_cmp(&rt.a_of(a).abs()).unwrap_or(std::cmp::Ordering::Equal));
+    r.sort_by(|a, b| rt.a_of(b).abs().total_cmp(&rt.a_of(a).abs()));
     r
 }
 
@@ -1225,16 +1225,16 @@ fn ranked_sources(rt: &Runtime) -> Vec<&Contrib> {
 /// global top-n pairs, because the pair table is an outer product).
 fn top_pairs(rt: &Runtime, n: usize) -> Vec<(Src, Src, f64)> {
     let mut bp: Vec<&Contrib> = rt.parts.iter().collect();
-    bp.sort_by(|a, b| b.p.abs().partial_cmp(&a.p.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    bp.sort_by(|a, b| b.p.abs().total_cmp(&a.p.abs()));
     let mut bq: Vec<&Contrib> = rt.parts.iter().collect();
-    bq.sort_by(|a, b| b.q.abs().partial_cmp(&a.q.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    bq.sort_by(|a, b| b.q.abs().total_cmp(&a.q.abs()));
     let mut out = Vec::new();
     for a in bp.iter().take(n) {
         for b in bq.iter().take(n) {
             out.push((a.src, b.src, rt.phi * a.p * b.q));
         }
     }
-    out.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| b.2.abs().total_cmp(&a.2.abs()));
     out.truncate(n);
     out
 }
@@ -1484,7 +1484,7 @@ fn html(m: &Model, ids: &[u32], focus: usize, y0: u32, traced: &[Traced], auto_i
         );
         // arrows tip to tail: the strongest sources by |p_c| + |q_c|, the rest as one arrow
         let mut by: Vec<&Contrib> = rt.parts.iter().filter(|c| c.src != Src::Offset).collect();
-        by.sort_by(|a, b| (b.p.abs() + b.q.abs()).partial_cmp(&(a.p.abs() + a.q.abs())).unwrap_or(std::cmp::Ordering::Equal));
+        by.sort_by(|a, b| (b.p.abs() + b.q.abs()).total_cmp(&(a.p.abs() + a.q.abs())));
         let mut arrows: Vec<(String, f64, f64)> = by.iter().take(6).map(|c| (src_txt(m, ids, &c.src), c.p, c.q)).collect();
         let (sp, sq) = arrows.iter().fold((0.0, 0.0), |a, x| (a.0 + x.1, a.1 + x.2));
         arrows.push((format!("other {} sources", by.len().saturating_sub(6)), rt.p - rt.rd.cg - sp, rt.q - rt.rd.cu - sq));

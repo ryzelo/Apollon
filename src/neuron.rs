@@ -567,9 +567,9 @@ pub fn top2(v: &[Arrow], k: usize) -> (Vec<Arrow>, Vec<Arrow>) {
         if k == 0 {
             return Vec::new();
         }
-        idx.select_nth_unstable_by(k - 1, |a, b| key(&v[*b]).partial_cmp(&key(&v[*a])).unwrap_or(std::cmp::Ordering::Equal));
+        idx.select_nth_unstable_by(k - 1, |a, b| key(&v[*b]).total_cmp(&key(&v[*a])));
         let mut out: Vec<Arrow> = idx[..k].iter().map(|&i| v[i]).collect();
-        out.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| key(b).total_cmp(&key(a)));
         out
     };
     (pick(&|a| a.p.abs()), pick(&|a| a.q.abs()))

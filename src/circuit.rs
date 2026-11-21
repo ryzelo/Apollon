@@ -773,7 +773,36 @@ struct Stats {
     dead_identical: bool,
     secs: f32,
     stopped: bool,
+    /// diagnostics ($APOLLON_SEARCH_STATS): tests, passes and seconds per phase (PHASES)
+    ph_tests: [usize; N_PH],
+    ph_passes: [usize; N_PH],
+    ph_secs: [f64; N_PH],
+    /// probe tests in refine: block passed alone / single element stuck (kept) / larger block stuck (split)
+    probe_fine: usize,
+    probe_kept: usize,
+    probe_split: usize,
+    /// accept: prefix scans, and how many of them committed
+    scans: usize,
+    scan_commits: usize,
+    /// order quality per level (1 … 4, 5 = final): (ordered pairs removed-before-kept, all removed/kept pairs)
+    auc: [(f64, f64); 6],
+    /// per level: elements in the groups, how many of them stayed
+    lvl_elems: [(usize, usize); 6],
 }
+
+/// phases of the search, for the diagnostics
+const PHASES: [&str; 10] = ["probe (refine)", "prefix scan (accept)", "rechunk (accept)", "dose curves (sweep)", "joint (sweep)", "recheck (tighten)", "commit rerun", "dead-piece rerun", "base runs", "other evals"];
+const N_PH: usize = 10;
+const PH_PROBE: usize = 0;
+const PH_PREFIX: usize = 1;
+const PH_RECHUNK: usize = 2;
+const PH_DOSE: usize = 3;
+const PH_JOINT: usize = 4;
+const PH_RECHECK: usize = 5;
+const PH_COMMIT: usize = 6;
+const PH_DEAD: usize = 7;
+const PH_BASE: usize = 8;
+const PH_OTHER: usize = 9;
 
 struct Engine<'a> {
     m: &'a Model,
@@ -795,6 +824,11 @@ struct Engine<'a> {
     fz: Option<Arc<NormScales>>,
     /// mean ablation: the means of every atom
     means: Option<Arc<Means>>,
+    /// diagnostics: the phase the next eval counts towards
+    phase: usize,
+    /// diagnostics ($APOLLON_ORACLE): the final state of an earlier search; groups are ordered so that
+    /// what stays in it comes last (a perfect order)
+    oracle: Option<State>,
 }
 
 /// A candidate: pieces, with their elementary changes per cell
@@ -831,6 +865,8 @@ impl<'a> Engine<'a> {
             tty: std::io::stderr().is_terminal(),
             fz,
             means,
+            phase: PH_OTHER,
+            oracle: None,
         };
         let own;
         let lr = match logits_ref {
@@ -879,6 +915,7 @@ impl<'a> Engine<'a> {
         self.fz.as_ref().and_then(|f| f.fin.get(self.g.focus).copied())
     }
     fn read(&self, xs: &[f32]) -> Vec<Out> {
+        let _pg = crate::prof::time(crate::prof::READ);
         read_out_fz(self.m, xs, &self.ys, &self.p_ref, self.ref_plp, self.fin())
     }
     /// a standalone run with this cut (and the frozen norms, if any)
@@ -950,6 +987,8 @@ impl<'a> Engine<'a> {
     /// norms, the cut, the readout). The packing of the batches and every pass are the same as one after
     /// another, so the outputs are bit-identical.
     fn eval(&mut self, pieces: &[Vec<Piece>], info: &str) -> Vec<Out> {
+        let t_eval = Instant::now();
+        let ph = std::mem::replace(&mut self.phase, PH_OTHER);
         let (t, focus) = (self.g.t, self.g.focus);
         let cands: Vec<Cand> = pieces.iter().map(|p| self.cand(p)).collect();
         let mut order: Vec<usize> = (0..cands.len()).collect();
@@ -968,6 +1007,17 @@ impl<'a> Engine<'a> {
                 rows += len;
                 batch.push(order[i]);
                 i += 1;
+            }
+            if crate::prof::on() {
+                let nl = self.g.layers.len();
+                let lb = batch.iter().map(|&k| cands[k].l0).min().unwrap_or(0);
+                let (mut tot, mut idle) = ((nl - lb) as u64 * t as u64, 0u64);
+                for &k in &batch {
+                    let len = (focus + 1 - cands[k].p0) as u64;
+                    tot += (nl - lb) as u64 * len;
+                    idle += (cands[k].l0 - lb) as u64 * len;
+                }
+                crate::prof::row_layers(tot, idle);
             }
             batches.push(batch);
         }
@@ -1017,7 +1067,10 @@ impl<'a> Engine<'a> {
             }
             self.st.passes += 1;
             self.st.tests += batch.len();
+            self.st.ph_passes[ph] += 1;
+            self.st.ph_tests[ph] += batch.len();
         }
+        self.st.ph_secs[ph] += t_eval.elapsed().as_secs_f64();
         if self.tty && cands.len() > 1 {
             eprint!("\r{}\r", " ".repeat(70));
         }
@@ -1029,6 +1082,7 @@ impl<'a> Engine<'a> {
     /// clean row of the pass is from the base run.
     fn run_batch(&self, cands: &[Cand], batch: &[usize]) -> (Vec<Out>, f32) {
         let (t, d, focus) = (self.g.t, self.g.d, self.g.focus);
+        let t_setup = Instant::now();
         let l0 = batch.iter().map(|&k| cands[k].l0).min().unwrap();
         let mut pos: Vec<usize> = (0..t).collect();
         let mut seg_start = vec![0usize; t];
@@ -1091,6 +1145,7 @@ impl<'a> Engine<'a> {
             frozen_norms: self.fz.clone(),
             ..Default::default()
         };
+        crate::prof::add(crate::prof::BATCH_SETUP, t_setup.elapsed().as_secs_f64());
         let tr = self.m.run(&ids_all, focus, &o);
         let mut xs = Vec::with_capacity(focus_rows.len() * d);
         for &r in &focus_rows {
@@ -1148,8 +1203,11 @@ impl<'a> Engine<'a> {
             }
         }
         self.rebuild(c.cells.keys().copied());
+        let t_c = Instant::now();
         let base = self.run_base_from(c.l0);
         self.st.passes += 1;
+        self.st.ph_passes[PH_COMMIT] += 1;
+        self.st.ph_secs[PH_COMMIT] += t_c.elapsed().as_secs_f64();
         if self.ok(&base.out, limit) {
             if let Some(k) = kl_batch {
                 self.st.batch_dev = self.st.batch_dev.max((k - base.out.kl).abs());
@@ -1177,7 +1235,7 @@ impl<'a> Engine<'a> {
     /// Greedy: blocks that may go individually, cheapest first, as long prefixes as possible per pass.
     /// Returns the blocks that could not go.
     fn accept(&mut self, groups: &[Group], mut rest: Vec<(Block, f32)>, limit: f32, info: &str) -> Vec<Block> {
-        rest.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        rest.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut rest: Vec<Block> = rest.into_iter().map(|x| x.0).collect();
         let mut refused: Vec<Block> = Vec::new();
         while !rest.is_empty() {
@@ -1187,12 +1245,15 @@ impl<'a> Engine<'a> {
             }
             let sizes = prefix_sizes(rest.len());
             let cands: Vec<Vec<Piece>> = sizes.iter().map(|&s| rest[..s].iter().flat_map(|b| groups[b.g].make(&b.ids)).collect()).collect();
+            self.phase = PH_PREFIX;
             let outs = self.eval(&cands, info);
+            self.st.scans += 1;
             let best = sizes.iter().zip(&outs).filter(|(_, o)| self.ok(o, limit * MARGIN)).map(|(&s, o)| (s, o.kl)).max_by_key(|x| x.0);
             match best {
                 Some((s, k)) => {
                     let pcs: Vec<Piece> = rest[..s].iter().flat_map(|b| groups[b.g].make(&b.ids)).collect();
                     if self.commit(&pcs, limit, Some(k)) {
+                        self.st.scan_commits += 1;
                         rest.drain(..s);
                     } else {
                         refused.push(rest.remove(s - 1));
@@ -1204,6 +1265,7 @@ impl<'a> Engine<'a> {
                     // alone catches anything that would still fit)
                     let n = rest.len().min(256);
                     let cands: Vec<Vec<Piece>> = rest[..n].iter().map(|b| groups[b.g].make(&b.ids)).collect();
+                    self.phase = PH_RECHUNK;
                     let outs = self.eval(&cands, info);
                     let mut keep: Vec<(Block, f32)> = Vec::new();
                     for (b, o) in rest.drain(..n).zip(outs) {
@@ -1217,7 +1279,7 @@ impl<'a> Engine<'a> {
                         refused.append(&mut rest);
                         break;
                     }
-                    keep.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    keep.sort_by(|a, b| a.1.total_cmp(&b.1));
                     let mut front: Vec<Block> = keep.into_iter().map(|x| x.0).collect();
                     front.append(&mut rest);
                     rest = front;
@@ -1272,6 +1334,7 @@ impl<'a> Engine<'a> {
         if cands.is_empty() {
             return 0;
         }
+        self.phase = PH_DOSE;
         let outs = self.eval(&cands, &format!("{info} dose curves"));
         drop(cands);
         // per group the options that pass alone: (pieces removed, ΔKL)
@@ -1289,7 +1352,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ratios.sort_by(|a, b| a.total_cmp(b));
         let mut mus: Vec<f64> = vec![0.0];
         for q in 0..28 {
             if let Some(&r) = ratios.get(((q as f64 + 0.5) / 28.0 * ratios.len() as f64) as usize) {
@@ -1302,7 +1365,7 @@ impl<'a> Engine<'a> {
                 .enumerate()
                 .map(|(gi, v)| {
                     let score = |&(k, c): &(usize, f64)| if mu.is_infinite() { if c <= 1e-7 { k as f64 } else { -1.0 } } else { k as f64 * apu[gi] as f64 - mu * c * 1.0 };
-                    v.iter().max_by(|a, b| score(a).partial_cmp(&score(b)).unwrap()).map_or(0, |x| if score(x) >= 0.0 { x.0 } else { 0 })
+                    v.iter().max_by(|a, b| score(a).total_cmp(&score(b))).map_or(0, |x| if score(x) >= 0.0 { x.0 } else { 0 })
                 })
                 .collect()
         };
@@ -1318,6 +1381,7 @@ impl<'a> Engine<'a> {
         }
         let mk = |ks: &[usize]| -> Vec<Piece> { groups.iter().zip(ks).filter(|(_, &k)| k > 0).flat_map(|(g, &k)| g.make(&g.ids[..k])).collect() };
         let joint: Vec<Vec<Piece>> = choices.iter().map(|c| mk(c)).collect();
+        self.phase = PH_JOINT;
         let outs = self.eval(&joint, &format!("{info} joint"));
         let gain = |c: &[usize]| -> u64 { c.iter().zip(&apu).map(|(&k, &a)| k as u64 * a).sum() };
         let mut best: Option<(usize, f32)> = None;
@@ -1376,13 +1440,20 @@ impl<'a> Engine<'a> {
                 break;
             }
             let cands: Vec<Vec<Piece>> = open.iter().map(|b| groups[b.g].make(&b.ids)).collect();
+            self.phase = PH_PROBE;
             let outs = self.eval(&cands, info);
             let mut fine: Vec<(Block, f32)> = Vec::new();
             let mut stuck: Vec<Block> = Vec::new();
             for (b, o) in open.drain(..).zip(outs) {
                 if self.ok(&o, limit * MARGIN) {
+                    self.st.probe_fine += 1;
                     fine.push((b, o.kl));
                 } else {
+                    if b.ids.len() == 1 {
+                        self.st.probe_kept += 1;
+                    } else {
+                        self.st.probe_split += 1;
+                    }
                     stuck.push(b);
                 }
             }
@@ -1443,6 +1514,7 @@ impl<'a> Engine<'a> {
                 Some(f) => (0..kept.len()).filter(|&i| f[i]).collect(),
             };
             let cands: Vec<Vec<Piece>> = idx.iter().map(|&i| vec![kept[i].clone()]).collect();
+            self.phase = PH_RECHECK;
             let outs = self.eval(&cands, info);
             let fine: Vec<(Block, f32)> = idx.iter().zip(&outs).filter(|(_, o)| self.ok(o, limit * MARGIN)).map(|(&i, o)| (Block { g: 0, ids: vec![i as u32] }, o.kl)).collect();
             if fine.is_empty() {
@@ -1619,8 +1691,11 @@ impl<'a> Engine<'a> {
         if n == 0 {
             return;
         }
+        let t_d = Instant::now();
         let (base, _, _) = self.run_base(false);
         self.st.passes += 1;
+        self.st.ph_passes[PH_DEAD] += 1;
+        self.st.ph_secs[PH_DEAD] += t_d.elapsed().as_secs_f64();
         let same = base.logits.len() == logits0.len() && base.logits.iter().zip(&logits0).all(|(a, b)| a.to_bits() == b.to_bits());
         self.st.dead_identical &= same;
         self.st.dead_atoms += n;
@@ -1666,8 +1741,12 @@ impl<'a> Engine<'a> {
     }
 
     fn piece_off(&self, pc: &Piece) -> bool {
+        self.piece_off_in(&self.state, pc)
+    }
+
+    fn piece_off_in(&self, st: &State, pc: &Piece) -> bool {
         let (l, p) = pc.lp();
-        let c = &self.state.cells[p][l];
+        let c = &st.cells[p][l];
         let mut ops = Vec::new();
         pc.ops(&self.g, &mut ops);
         ops.iter().all(|op| match op {
@@ -1734,7 +1813,7 @@ struct Block {
 impl Group {
     fn new(kind: GK, items: Vec<(u32, f32)>) -> Self {
         let mut items = items;
-        items.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+        items.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         Group { kind, ids: items.iter().map(|x| x.0).collect(), proxy: items.iter().map(|x| x.1).collect() }
     }
     fn make(&self, sel: &[u32]) -> Vec<Piece> {
@@ -1781,6 +1860,44 @@ fn site_input<'b>(inp: &'b LayerInputs, x_tok: &'b [f32], s: Site, p: usize, d: 
 }
 
 impl<'a> Engine<'a> {
+    /// diagnostics ($APOLLON_ORACLE): reorder every group so that what stays in the oracle state comes last
+    /// (stable: within both parts the magnitude order stays)
+    fn oracle_sort(&self, groups: &mut [Group]) {
+        let Some(or) = &self.oracle else { return };
+        for gr in groups.iter_mut() {
+            let mut items: Vec<(bool, u32, f32)> =
+                gr.ids.iter().zip(&gr.proxy).map(|(&i, &p)| (!gr.make(&[i]).iter().all(|pc| self.piece_off_in(or, pc)), i, p)).collect();
+            items.sort_by_key(|x| x.0);
+            gr.ids = items.iter().map(|x| x.1).collect();
+            gr.proxy = items.iter().map(|x| x.2).collect();
+        }
+    }
+
+    /// diagnostics: how well the order of the groups separated what went (should come first) from what
+    /// stayed, measured against the current state
+    fn order_quality(&mut self, groups: &[Group], slot: usize) {
+        let (mut good, mut all) = (0f64, 0f64);
+        let (mut n, mut k) = (0usize, 0usize);
+        for gr in groups {
+            let (mut removed, mut kept) = (0f64, 0f64);
+            for &i in &gr.ids {
+                if gr.make(&[i]).iter().all(|pc| self.piece_off(pc)) {
+                    removed += 1.0;
+                } else {
+                    good += removed;
+                    kept += 1.0;
+                }
+            }
+            all += removed * kept;
+            n += gr.ids.len();
+            k += kept as usize;
+        }
+        self.st.auc[slot].0 += good;
+        self.st.auc[slot].1 += all;
+        self.st.lvl_elems[slot].0 += n;
+        self.st.lvl_elems[slot].1 += k;
+    }
+
     /// The groups of the next level for the pieces kept so far. Neurons and the gate/projection of PLE
     /// dimensions have no level 3 of their own (switching off one of their units = switching off the
     /// whole neuron/dimension): they pass through to level 4.
@@ -2234,7 +2351,8 @@ fn search(e: &mut Engine, o: &Opts, total_atoms: u64, st: &Style, path: usize) -
     // (pieces that are off already – the paths before – cannot matter)
     comps.retain(|pc| !e.piece_off(pc));
     let n_comps = comps.len();
-    let groups = vec![Group { kind: GK::List(comps), ids: (0..n_comps as u32).collect(), proxy: vec![0.0; n_comps] }];
+    let mut groups = vec![Group { kind: GK::List(comps), ids: (0..n_comps as u32).collect(), proxy: vec![0.0; n_comps] }];
+    e.oracle_sort(&mut groups);
     let mut logs: Vec<LevelLog> = Vec::new();
     let depth = o.depth.clamp(1, 4);
     let mut kept: Vec<Piece>;
@@ -2244,14 +2362,19 @@ fn search(e: &mut Engine, o: &Opts, total_atoms: u64, st: &Style, path: usize) -
         e.prune_dead();
         kept = k.into_iter().filter(|pc| !e.piece_off(pc)).collect();
         e.tighten(&mut kept, o.kl * FRAC[0], Some(1), "level 1 recheck");
+        e.order_quality(&groups, 1);
         logs.push(LevelLog { level: 1, groups: 1, pieces_in: n_comps, kept: kept.len(), unresolved: un, atoms: e.atoms_kept(), kl: e.kl(), tests: e.st.tests - t0, passes: e.st.passes - p0, secs: s0.elapsed().as_secs_f32() });
         report_level(logs.last().unwrap(), total_atoms, st);
     }
     for level in 2..=depth {
         let (t0, p0, s0) = (e.st.tests, e.st.passes, Instant::now());
+        let t_b = Instant::now();
         let (_, inp, x_tok) = e.run_base(true);
         e.st.passes += 1;
-        let (groups, pass) = e.expand(&kept, level, &inp, &x_tok);
+        e.st.ph_passes[PH_BASE] += 1;
+        e.st.ph_secs[PH_BASE] += t_b.elapsed().as_secs_f64();
+        let (mut groups, pass) = e.expand(&kept, level, &inp, &x_tok);
+        e.oracle_sort(&mut groups);
         drop(inp);
         let n_in: usize = groups.iter().map(|g| g.ids.len()).sum();
         // columns of column-wise sites needed at level 4: fetch per matrix in one pass
@@ -2270,6 +2393,7 @@ fn search(e: &mut Engine, o: &Opts, total_atoms: u64, st: &Style, path: usize) -
         e.prune_dead();
         kept = k.into_iter().chain(pass).filter(|pc| !e.piece_off(pc)).collect();
         e.tighten(&mut kept, o.kl * FRAC[level - 1], Some(1), &format!("level {level} recheck"));
+        e.order_quality(&groups, level);
         logs.push(LevelLog { level, groups: groups.len(), pieces_in: n_in, kept: kept.len(), unresolved: un, atoms: e.atoms_kept(), kl: e.kl(), tests: e.st.tests - t0, passes: e.st.passes - p0, secs: s0.elapsed().as_secs_f32() });
         report_level(logs.last().unwrap(), total_atoms, st);
     }
@@ -2281,9 +2405,13 @@ fn search(e: &mut Engine, o: &Opts, total_atoms: u64, st: &Style, path: usize) -
         let atoms0 = e.atoms_kept();
         let (singles, blocks): (Vec<Piece>, Vec<Piece>) = kept.drain(..).partition(|p| p.len() <= 1);
         if !blocks.is_empty() {
+            let t_b = Instant::now();
             let (_, inp, x_tok) = e.run_base(true);
             e.st.passes += 1;
-            let groups: Vec<Group> = blocks.iter().map(|b| e.block_group(b, &inp, &x_tok)).collect();
+            e.st.ph_passes[PH_BASE] += 1;
+            e.st.ph_secs[PH_BASE] += t_b.elapsed().as_secs_f64();
+            let mut groups: Vec<Group> = blocks.iter().map(|b| e.block_group(b, &inp, &x_tok)).collect();
+            e.oracle_sort(&mut groups);
             drop(inp);
             let mut need: BTreeMap<(usize, Site), Vec<u32>> = BTreeMap::new();
             for gr in &groups {
@@ -2297,6 +2425,7 @@ fn search(e: &mut Engine, o: &Opts, total_atoms: u64, st: &Style, path: usize) -
             let (k, _) = e.refine(&groups, o.kl, true, true, "resolving blocks");
             e.prune_dead();
             kept = singles.into_iter().chain(k).filter(|pc| !e.piece_off(pc)).collect();
+            e.order_quality(&groups, 5);
         } else {
             kept = singles;
         }
@@ -2311,6 +2440,28 @@ fn search(e: &mut Engine, o: &Opts, total_atoms: u64, st: &Style, path: usize) -
         report_level(logs.last().unwrap(), total_atoms, st);
     }
     (logs, leaves)
+}
+
+/// diagnostics: where the tests and the time of one search went, and how good its order was
+fn search_stats(label: &str, s: &Stats, atoms: u64, kl: f32, secs: f32) {
+    eprintln!("diag: {label}: {} atoms on, KL {}, {} tests in {} passes, {} commits ({} refused), {:.1} s", big(atoms), num(kl, 4), thousands(s.tests), thousands(s.passes), s.commits, s.refused, secs);
+    let tsec: f64 = s.ph_secs.iter().sum();
+    for i in 0..N_PH {
+        if s.ph_passes[i] == 0 {
+            continue;
+        }
+        eprintln!("diag:   {:<22} {:>8} tests {:>6} passes {:>8.1} s ({:>4.1}%)", PHASES[i], thousands(s.ph_tests[i]), thousands(s.ph_passes[i]), s.ph_secs[i], 100.0 * s.ph_secs[i] / tsec.max(1e-9));
+    }
+    eprintln!("diag:   probe outcomes: {} passed alone, {} single elements kept, {} blocks split", thousands(s.probe_fine), thousands(s.probe_kept), thousands(s.probe_split));
+    eprintln!("diag:   prefix scans: {}, {} of them committed", thousands(s.scans), thousands(s.scan_commits));
+    for (lv, (&(g, a), &(n, k))) in s.auc.iter().zip(&s.lvl_elems).enumerate().skip(1) {
+        if n == 0 {
+            continue;
+        }
+        let name = if lv == 5 { "final".to_string() } else { format!("level {lv}") };
+        let auc = if a > 0.0 { format!("{:.3}", g / a) } else { "–".into() };
+        eprintln!("diag:   order quality {name}: AUC {auc} ({} of {} elements stayed)", thousands(k), thousands(n));
+    }
 }
 
 /// add the counters of one engine to another (the report shows them for all searches together)
@@ -2416,7 +2567,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     let (logz, p_full) = softmax(&full.logits);
     let plp_full: f64 = full.logits.iter().map(|x| { let lp = *x as f64 - logz; lp.exp() * lp }).sum();
     let mut order: Vec<usize> = (0..full.logits.len()).collect();
-    order.sort_by(|a, b| full.logits[*b].partial_cmp(&full.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|a, b| full.logits[*b].total_cmp(&full.logits[*a]));
     let top_ref = order[0] as u32;
     let y0 = target.unwrap_or(top_ref);
     let rival = order.iter().map(|&i| i as u32).find(|&i| i != y0).unwrap();
@@ -2497,6 +2648,31 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
             leaves.extend(lv);
             merge_stats(&mut stats, &e.st);
             off_all = e.state.clone();
+            let diag = std::env::var_os("APOLLON_SEARCH_STATS").is_some() || std::env::var_os("APOLLON_ORACLE").is_some();
+            if diag {
+                search_stats("path 1, magnitude order", &e.st, e.atoms_kept(), e.kl(), paths[0].secs);
+            }
+            if std::env::var_os("APOLLON_ORACLE").is_some() {
+                println!();
+                println!("{}", st.bold("oracle rerun: the same search, every group ordered so that what path 1 kept comes last"));
+                let mut eo = new_engine(State::empty(t, nl), Some(&full.logits));
+                eo.oracle = Some(e.state.clone());
+                let s0 = Instant::now();
+                let _ = search(&mut eo, o, total_atoms, st, 1);
+                let secs = s0.elapsed().as_secs_f32();
+                search_stats("path 1, oracle order", &eo.st, eo.atoms_kept(), eo.kl(), secs);
+                // how the two circuits relate
+                let (mut both, mut only_a, mut only_b) = (0u64, 0u64, 0u64);
+                let union = e.state.intersect(&eo.state, &e.g);
+                let a = e.atoms_kept();
+                let b2 = eo.atoms_kept();
+                let u = new_engine(union, Some(&full.logits)).atoms_kept();
+                both += a + b2 - u;
+                only_a += u - b2;
+                only_b += u - a;
+                eprintln!("diag: circuits – magnitude order {} atoms, oracle order {} atoms, shared {}, only magnitude {}, only oracle {}", big(a), big(b2), big(both), big(only_a), big(only_b));
+                eprintln!("diag: speed-up of a perfect order: tests ×{:.2}, passes ×{:.2}, time ×{:.2}", e.st.tests as f64 / eo.st.tests.max(1) as f64, e.st.passes as f64 / eo.st.passes.max(1) as f64, paths[0].secs / secs.max(1e-3));
+            }
         }
         loop {
             if paths.len() >= max_paths {
@@ -2560,6 +2736,7 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
         }
     }
     // ---------------------------------------------------------------- the union of all paths
+    let t_search = t_all.elapsed().as_secs_f64();
     let mut eu = if paths.len() == 1 { e } else { new_engine(off_all, Some(&full.logits)) };
     let circuit_out = eu.base.out;
     let comp_out = eu.out_of(complement(&eu), &p_full, plp_full).0;
@@ -2576,7 +2753,10 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
     }
     let (units, comps) = alive_pieces(&eu);
     let cands: Vec<Vec<Piece>> = units.iter().chain(&comps).map(|pc| vec![pc.clone()]).collect();
+    let t_u = Instant::now();
     let outs = eu.eval(&cands, "union: every unit and component alone");
+    let t_units = t_u.elapsed().as_secs_f64();
+    crate::prof::report("after the union tests");
     let nu = units.len();
     fx.units = units.into_iter().zip(outs[..nu].iter().copied()).collect();
     fx.comps = comps.into_iter().zip(outs[nu..].iter().copied()).collect();
@@ -2585,17 +2765,22 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
         eu.st = stats;
     }
     // values of the atoms in the pass of the union
+    let t_v = Instant::now();
     let (_, inp, x_tok) = eu.run_base(true);
     for lf in leaves.iter_mut() {
         lf.value = atom_value(&eu, &lf.piece, &inp, &x_tok);
     }
     drop(inp);
-    leaves.sort_by(|a, b| b.in_path.kl.partial_cmp(&a.in_path.kl).unwrap_or(std::cmp::Ordering::Equal));
+    leaves.sort_by(|a, b| b.in_path.kl.total_cmp(&a.in_path.kl));
+    let t_values = t_v.elapsed().as_secs_f64();
     eu.st.secs = t_all.elapsed().as_secs_f32();
+    let t_h = Instant::now();
     let r = Report { e: &eu, refs: &refs, ref_pos: &ref_pos, o, ids, focus, full_out, circuit_out, comp_out, total_atoms, logs: &paths[0].logs, leaves: &leaves, empty_identical, paths: &paths, fx: &fx, stop };
     terminal(&r, st);
     std::fs::write(&o.html, html(&r)).map_err(|x| format!("{}: {x}", o.html.display()))?;
     println!("{}", st.dim(&format!("HTML: {}", o.html.display())));
+    let t_html = t_h.elapsed().as_secs_f64();
+    let t_f = Instant::now();
     if let Some(dir) = &o.out_dir {
         let closure = out::write(&r, dir, &p_full, plp_full)?;
         let what = match closure {
@@ -2604,6 +2789,17 @@ pub fn run(m: &Model, ids: &[u32], focus: usize, target: Option<u32>, o: &Opts, 
             None => "too many atoms on to list them: units and components only".into(),
         };
         println!("{}", st.dim(&format!("result folder: {} ({what})", dir.display())));
+    }
+    if crate::prof::on() {
+        eprintln!(
+            "diag: stages: search (every path, complement) {:.1} s · union: every unit and component alone {:.1} s ({} tests) · atom values {:.1} s · report + HTML {:.1} s · result folder {:.1} s",
+            t_search,
+            t_units,
+            thousands(cands.len()),
+            t_values,
+            t_html,
+            t_f.elapsed().as_secs_f64()
+        );
     }
     if let Some(f) = &o.dump {
         std::fs::write(f, dump_json(&r, &full.logits)).map_err(|x| format!("{}: {x}", f.display()))?;
@@ -2976,7 +3172,7 @@ fn terminal(r: &Report, st: &Style) {
     }
     if !r.fx.units.is_empty() {
         let mut us: Vec<&(Piece, Out)> = r.fx.units.iter().collect();
-        us.sort_by(|a, b| b.1.kl.partial_cmp(&a.1.kl).unwrap_or(std::cmp::Ordering::Equal));
+        us.sort_by(|a, b| b.1.kl.total_cmp(&a.1.kl));
         println!();
         println!("{}", st.bold(&format!("Units, most necessary first ({} heads, K/V groups, neurons, PLE dimensions; each switched off alone against the {})", r.fx.units.len(), if many { "union" } else { "circuit" })));
         for (pc, o2) in us.iter().take(r.o.show.min(15)) {
@@ -3118,7 +3314,7 @@ fn html(r: &Report) -> String {
     }
     if !r.fx.units.is_empty() {
         let mut us: Vec<&(Piece, Out)> = r.fx.units.iter().chain(&r.fx.comps).collect();
-        us.sort_by(|a, b| b.1.kl.partial_cmp(&a.1.kl).unwrap_or(std::cmp::Ordering::Equal));
+        us.sort_by(|a, b| b.1.kl.total_cmp(&a.1.kl));
         h += &format!("<h2>Components and units</h2><p class=\"mu\">Every component (attention, K/V, MLP, PLE at one position) and every unit (head, K/V group, neuron, PLE dimension) with an atom on, switched off alone against the {}.</p><table class=\"tbl leaf\"><tr><th>part</th><th>top without it</th><th>log-odds {}</th><th>KL</th></tr>", if r.paths.len() > 1 { "union of all paths" } else { "circuit" }, chip(m, ys[0]));
         for (pc, o2) in us {
             h += &format!("<tr><td><code>{}</code></td><td>{} {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>", esc_html(&pc.name(m)), chip(m, o2.top[0].0), pct(o2.top[0].1), num(o2.lo[0], 2), num(o2.kl, 4));

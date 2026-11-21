@@ -516,6 +516,24 @@ fn write_json(dir: &FsPath, rel: &str, v: &Value) -> Result<(), String> {
     write_json_as(dir, rel, v, true)
 }
 
+/// Write many files at once: the folders first (each once), then the files in parallel. One file at a
+/// time costs ~0.5 ms each on Windows (file creation, virus scan), which adds up over 10⁵ unit files.
+fn write_all(dir: &FsPath, files: Vec<(String, String)>) -> Result<(), String> {
+    use rayon::prelude::*;
+    let parents: BTreeSet<std::path::PathBuf> = files.iter().filter_map(|(rel, _)| dir.join(rel).parent().map(|p| p.to_path_buf())).collect();
+    for p in &parents {
+        std::fs::create_dir_all(p).map_err(|x| format!("{}: {x}", p.display()))?;
+    }
+    files.into_par_iter().try_for_each(|(rel, text)| {
+        let f = dir.join(&rel);
+        std::fs::write(&f, text).map_err(|x| format!("{}: {x}", f.display()))
+    })
+}
+
+fn json_text(v: &Value, pretty: bool) -> String {
+    if pretty { serde_json::to_string_pretty(v) } else { serde_json::to_string(v) }.unwrap()
+}
+
 fn write_json_as(dir: &FsPath, rel: &str, v: &Value, pretty: bool) -> Result<(), String> {
     let f = dir.join(rel);
     if let Some(parent) = f.parent() {
@@ -1169,6 +1187,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
     };
     let fx_json = |o: Option<&Out>| o.map_or(Value::Null, |o| out_json(m, o));
     let mut unit_rows: Vec<Value> = Vec::new();
+    let mut unit_files: Vec<(String, String)> = Vec::new();
     let all_units: BTreeSet<Unit> = unit_atoms.keys().copied().chain(unit_fx.keys().copied()).collect();
     for u in &all_units {
         let ids = unit_atoms.get(u).cloned().unwrap_or_default();
@@ -1176,12 +1195,12 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         let direct: f32 = ids.iter().filter_map(|&i| infos[i].to_output.map(|(a, b2)| a - b2)).sum();
         let reads: Vec<Value> = {
             let mut v: Vec<(&(Node, Node), &(f64, f64, usize))> = edges.iter().filter(|((_, to), _)| *to == Node::U(*u)).collect();
-            v.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap_or(std::cmp::Ordering::Equal));
+            v.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
             v.iter().map(|((f, _), (s, sa, n))| json!({"unit": node_name(f), "sum": s, "sum_abs": sa, "atom_edges": n})).collect()
         };
         let read_by: Vec<Value> = {
             let mut v: Vec<(&(Node, Node), &(f64, f64, usize))> = edges.iter().filter(|((f, _), _)| *f == Node::U(*u)).collect();
-            v.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap_or(std::cmp::Ordering::Equal));
+            v.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
             v.iter().map(|((_, to), (s, sa, n))| json!({"unit": node_name(to), "sum": s, "sum_abs": sa, "atom_edges": n})).collect()
         };
         let summary = json!({
@@ -1194,12 +1213,12 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             "flow": unit_out.get(u).map(|v| flow_json(v)),
             "flow_from": unit_in.get(u).map(|v| {
                 let mut v: Vec<&(FNode, Vec<f32>)> = v.iter().collect();
-                v.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_by(|a, b| diff(&b.1).abs().total_cmp(&diff(&a.1).abs()));
                 v.iter().take(MAX_EDGES).map(|(n2, x)| json!({"from": fnode_name(n2), "flow": flow_json(x)})).collect::<Vec<_>>()
             }),
             "flow_to": unit_to.get(u).map(|v| {
                 let mut v: Vec<&(FNode, Vec<f32>)> = v.iter().collect();
-                v.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_by(|a, b| diff(&b.1).abs().total_cmp(&diff(&a.1).abs()));
                 v.iter().take(MAX_EDGES).map(|(n2, x)| json!({"to": fnode_name(n2), "flow": flow_json(x)})).collect::<Vec<_>>()
             }),
         });
@@ -1210,9 +1229,9 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                     let inf = &infos[i];
                     let lf = leaf_of[i].map(|li| &r.leaves[li]);
                     let mut src: Vec<&Src> = inf.sources.iter().collect();
-                    src.sort_by(|a, b| b.c.abs().partial_cmp(&a.c.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                    src.sort_by(|a, b| b.c.abs().total_cmp(&a.c.abs()));
                     let mut ub = used_by[i].clone();
-                    ub.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                    ub.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
                     let (src_l, src_rest) = capped(src.iter().map(|s| json!({"from": inf_name(&atoms, s.from), "contribution": s.c, "via": s.via})).collect(), &src.iter().map(|s| s.c).collect::<Vec<_>>());
                     let (ub_l, ub_rest) = capped(ub.iter().map(|(k, c, w)| json!({"atom": inf_name(&atoms, *k), "contribution": c, "via": w})).collect(), &ub.iter().map(|x| x.1).collect::<Vec<_>>());
                     json!({
@@ -1233,12 +1252,13 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                 .collect();
             let mut v = summary.clone();
             v["atoms"] = json!(atoms_json);
-            write_json_as(dir, &file, &v, ids.len() <= PRETTY_ATOMS)?;
+            unit_files.push((file, json_text(&v, ids.len() <= PRETTY_ATOMS)));
         } else {
-            write_json(dir, &file, &summary)?;
+            unit_files.push((file, json_text(&summary, true)));
         }
         unit_rows.push(summary);
     }
+    write_all(dir, unit_files)?;
     fn inf_name(atoms: &[A], i: usize) -> String {
         atoms[i].name()
     }
@@ -1246,9 +1266,11 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
     let mut layers_json: Vec<Value> = Vec::new();
     for l in 0..nl {
         let units_l: Vec<&Value> = unit_rows.iter().filter(|u| u["layer"].as_u64() == Some(l as u64)).collect();
-        let comps_l: Vec<Value> = comp_fx
-            .iter()
-            .filter(|((cl, _, _), _)| *cl == l)
+        // sorted by position and kind, so the file is the same in every run (comp_fx is a HashMap)
+        let mut comps_here: Vec<_> = comp_fx.iter().filter(|((cl, _, _), _)| *cl == l).collect();
+        comps_here.sort_by_key(|((_, p, k), _)| (*p, *k));
+        let comps_l: Vec<Value> = comps_here
+            .into_iter()
             .map(|((_, p, k), o)| json!({"component": k, "position": p, "token": m.tok.piece(e.ids[*p]), "switched_off_alone_in_union": out_json(m, o)}))
             .collect();
         if units_l.is_empty() && comps_l.is_empty() {
@@ -1268,9 +1290,9 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         .iter()
         .map(|(n, dd)| {
             let mut ins: Vec<(&(Node, Node), &(f64, f64, usize))> = edges.iter().filter(|((_, to), _)| to == *n).collect();
-            ins.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap_or(std::cmp::Ordering::Equal));
+            ins.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
             let mut outs: Vec<(&(Node, Node), &(f64, f64, usize))> = edges.iter().filter(|((f, _), _)| f == *n).collect();
-            outs.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap_or(std::cmp::Ordering::Equal));
+            outs.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
             let file = match n {
                 Node::U(u) => json!(u.file(wl, wp)),
                 Node::Output => Value::Null,
@@ -1282,7 +1304,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         .collect();
     let unreached: Vec<String> = all_units.iter().filter(|u| !depth.contains_key(&Node::U(**u))).map(|u| u.name()).collect();
     let mut direct: Vec<(usize, f32)> = infos.iter().enumerate().filter_map(|(i, x)| x.to_output.map(|(a, b2)| (i, a - b2))).collect();
-    direct.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    direct.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
     let (closure, worst_at) = cx.worst.borrow().clone();
     let closure_v = if detailed { json!(closure) } else { Value::Null };
     write_json(
@@ -1307,9 +1329,9 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         let tokj = |t: u32| json!({"id": t, "text": m.tok.piece(t)});
         // units by what flows out of them (onto target − rival)
         let mut units_f: Vec<(&Unit, &Vec<f32>)> = unit_out.iter().collect();
-        units_f.sort_by(|a, b| diff(b.1).abs().partial_cmp(&diff(a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        units_f.sort_by(|a, b| diff(b.1).abs().total_cmp(&diff(a.1).abs()));
         let mut edges_f: Vec<(&(FNode, FNode), &Vec<f32>)> = fl.edges.iter().collect();
-        edges_f.sort_by(|a, b| diff(b.1).abs().partial_cmp(&diff(a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        edges_f.sort_by(|a, b| diff(b.1).abs().total_cmp(&diff(a.1).abs()));
         // roots by kind and position
         let mut roots: Vec<(&String, Vec<f32>)> = Vec::new();
         {
@@ -1321,7 +1343,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                 }
             }
             roots.extend(acc);
-            roots.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            roots.sort_by(|a, b| diff(&b.1).abs().total_cmp(&diff(&a.1).abs()));
         }
         // the main path: from the output backwards, always along the incoming edge that carries the most
         let mut path: Vec<Value> = Vec::new();
@@ -1332,7 +1354,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             if ins.is_empty() {
                 break;
             }
-            ins.sort_by(|a, b| diff(b.1).partial_cmp(&diff(a.1)).unwrap_or(std::cmp::Ordering::Equal));
+            ins.sort_by(|a, b| diff(b.1).total_cmp(&diff(a.1)));
             let into: f32 = ins.iter().map(|(_, v)| diff(v)).sum();
             path.push(json!({"into": fnode_name(&node), "flow_into_it": into, "share_of_total": if total.abs() > 1e-9 { json!(into / total) } else { Value::Null },
                 "strongest_inputs": ins.iter().take(5).map(|(a, v)| json!({"from": fnode_name(a), "flow": diff(v), "share_of_total": share(v)})).collect::<Vec<_>>()}));
@@ -1358,7 +1380,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         }
         let top_atoms: Vec<Value> = {
             let mut by: Vec<usize> = (0..atoms.len()).collect();
-            by.sort_by(|&a, &b| (fl.atom[b * kk] - fl.atom[b * kk + 1]).abs().partial_cmp(&(fl.atom[a * kk] - fl.atom[a * kk + 1]).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            by.sort_by(|&a, &b| (fl.atom[b * kk] - fl.atom[b * kk + 1]).abs().total_cmp(&(fl.atom[a * kk] - fl.atom[a * kk + 1]).abs()));
             by.iter().take(300).map(|&i| json!({"atom": atoms[i].name(), "unit": atoms[i].unit(g).name(), "flow": flow_json(&fl.atom[i * kk..i * kk + 2]), "share_of_total": share(&fl.atom[i * kk..i * kk + 2])})).collect()
         };
         write_json(dir, "flow.json", &json!({
@@ -1407,7 +1429,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             let inf = &infos[i];
             let (l, p) = lp_of(&inf.a);
             let mut src: Vec<&Src> = inf.sources.iter().collect();
-            src.sort_by(|a, b| b.c.abs().partial_cmp(&a.c.abs()).unwrap_or(std::cmp::Ordering::Equal));
+            src.sort_by(|a, b| b.c.abs().total_cmp(&a.c.abs()));
             let v = json!({"step": step + 1, "layer": l, "position": p, "token": m.tok.piece(e.ids[p]), "atom": inf.a.name(), "unit": inf.a.unit(g).name(),
                 "value": inf.value, "value_when_off": inf.ablated, "flow": flow_json(&fl.atom[i * kk..i * kk + 2]),
                 "reads": src.iter().take(3).map(|s2| json!({"from": atoms[s2.from].name(), "contribution": s2.c, "via": s2.via})).collect::<Vec<_>>(),
@@ -1441,7 +1463,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
         );
         md += "## Where it starts\n\n";
         let mut emb: Vec<(&String, &Vec<f32>)> = roots.iter().filter(|(r, _)| r.starts_with("embedding")).map(|(r, v)| (*r, v)).collect();
-        emb.sort_by(|a, b| diff(b.1).abs().partial_cmp(&diff(a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+        emb.sort_by(|a, b| diff(b.1).abs().total_cmp(&diff(a.1).abs()));
         let emb_total: f32 = emb.iter().map(|(_, v)| diff(v)).sum();
         for (r, v) in emb.iter().take(6) {
             md += &format!("- {r}: {:+.3} ({})\n", diff(v), pct1(diff(v) / total));
@@ -1462,7 +1484,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             let (l, p) = u.lp();
             let n_at = unit_atoms.get(u).map_or(0, |x| x.len());
             let mut ins: Vec<(FNode, Vec<f32>)> = unit_in.get(u).cloned().unwrap_or_default();
-            ins.sort_by(|a, b| diff(&b.1).abs().partial_cmp(&diff(&a.1).abs()).unwrap_or(std::cmp::Ordering::Equal));
+            ins.sort_by(|a, b| diff(&b.1).abs().total_cmp(&diff(&a.1).abs()));
             let voice = fl.unit_voices.get(u);
             let off = unit_fx.get(u);
             steps_json.push(json!({"step": k + 1, "unit": u.name(), "layer": l, "position": p, "token": m.tok.piece(e.ids[p]), "multiplications": n_at,
@@ -1493,7 +1515,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                     let nh = g.layers[l].nh;
                     let pr = &li.probs[(p * nh + h) * t..(p * nh + h + 1) * t];
                     let mut ks: Vec<usize> = g.keys(l, p).collect();
-                    ks.sort_by(|a, b| pr[*b].partial_cmp(&pr[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                    ks.sort_by(|a, b| pr[*b].total_cmp(&pr[*a]));
                     Some(format!("looks at {}", ks.iter().take(4).map(|&j| format!("[{j}] {:?} {:.0}%", m.tok.piece(e.ids[j]), pr[j] * 100.0)).collect::<Vec<_>>().join(" · ")))
                 }
                 Unit::Neuron { n, .. } => {
@@ -1518,7 +1540,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
             let fmt_parts = |parts: &[(String, f32)], k: usize| -> String { parts.iter().take(k).map(|(n2, v)| format!("{n2} {v:+.3}")).collect::<Vec<_>>().join(" · ") };
             let sorted = |mut acc: HashMap<String, f32>| -> Vec<(String, f32)> {
                 let mut v: Vec<(String, f32)> = acc.drain().collect();
-                v.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                v.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
                 v
             };
             match *u {
@@ -1556,7 +1578,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                     let parts = sorted(by_src);
                     let tot: f32 = parts.iter().map(|x| x.1).sum();
                     why_dev = why_dev.max(cx.check(tot, a_v, parts.iter().map(|x| x.1.abs()).sum(), || format!("why-split of {}", u.name())));
-                    singles.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                    singles.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
                     md += &format!("- why it fires: a = {a_v:+.3} = {} …\n", fmt_parts(&parts, 5));
                     md += &format!("  - strongest single multiplications: {}\n", fmt_parts(&singles, 4));
                     steps_json[steps_len - 1]["why"] = json!({"activation": a_v, "by_source": parts.iter().take(12).map(|(n2, v)| json!({"source": n2, "share": v})).collect::<Vec<_>>(),
@@ -1568,7 +1590,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
                     let sc = m.blocks[l].attn.scale;
                     let pr = &li.probs[(p * nh + h) * t..(p * nh + h + 1) * t];
                     let mut ks: Vec<usize> = g.keys(l, p).collect();
-                    ks.sort_by(|a, b| pr[*b].partial_cmp(&pr[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                    ks.sort_by(|a, b| pr[*b].total_cmp(&pr[*a]));
                     // check: the scores as split here, through scale, softcap and softmax, give the weights the model used
                     {
                         let gr = h / (nh / lg.nkv);
@@ -1657,7 +1679,7 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
     let mut bias_list: Vec<Value> = Vec::new();
     if let (Some(nb), true) = (r.o.bias, !unit_out.is_empty()) {
         let mut ns: Vec<(Unit, f32)> = unit_out.iter().filter(|(u, _)| matches!(u, Unit::Neuron { .. })).map(|(u, v)| (*u, diff(v))).collect();
-        ns.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        ns.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
         let mut seen: BTreeSet<(usize, u32)> = BTreeSet::new();
         let trb = crate::bias::record(m, e.ids, focus);
         let bdir = dir.join("bias");
@@ -1680,14 +1702,15 @@ pub(super) fn write(r: &Report, dir: &FsPath, p_full: &[f32], plp_full: f64) -> 
     let s = &e.st;
     let comps_json: Vec<Value> = {
         let mut v: Vec<(&(usize, usize, &str), &Out)> = comp_fx.iter().collect();
-        v.sort_by(|a, b| b.1.kl.partial_cmp(&a.1.kl).unwrap_or(std::cmp::Ordering::Equal));
+        // ties (equal or NaN KL) by the key, so the order is the same in every run
+        v.sort_by(|a, b| b.1.kl.total_cmp(&a.1.kl).then(a.0.cmp(b.0)));
         v.iter().map(|((l, p, k), o)| json!({"component": format!("S{l} {k} [{p}]"), "layer": l, "position": p, "kind": k, "switched_off_alone_in_union": out_json(m, o)})).collect()
     };
     let mut units_sorted = unit_rows.clone();
     units_sorted.sort_by(|a, b| {
         let ka = a["switched_off_alone_in_union"]["kl"].as_f64().unwrap_or(0.0);
         let kb = b["switched_off_alone_in_union"]["kl"].as_f64().unwrap_or(0.0);
-        kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+        kb.total_cmp(&ka)
     });
     write_json(
         dir,
@@ -1849,9 +1872,9 @@ fn flow_split(atoms: &[A], infos: &[Info], cx: &Ctx, e: &Engine, m: &Model, g: &
     if !tr.logits.is_empty() {
         let mut idx: Vec<usize> = (0..tr.logits.len()).collect();
         let kk = 24.min(idx.len());
-        idx.select_nth_unstable_by(kk - 1, |a, b| tr.logits[*b].partial_cmp(&tr.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.select_nth_unstable_by(kk - 1, |a, b| tr.logits[*b].total_cmp(&tr.logits[*a]));
         let mut top = idx[..kk].to_vec();
-        top.sort_by(|a, b| tr.logits[*b].partial_cmp(&tr.logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+        top.sort_by(|a, b| tr.logits[*b].total_cmp(&tr.logits[*a]));
         for i in top {
             if toks.len() >= 20 {
                 break;
@@ -2085,7 +2108,7 @@ fn flow_split(atoms: &[A], infos: &[Info], cx: &Ctx, e: &Engine, m: &Model, g: &
             for (r, un) in units.iter().enumerate() {
                 let row = &lg[r * vr..(r + 1) * vr];
                 let mut idx: Vec<usize> = (0..vr).collect();
-                idx.sort_by(|a, b| row[*b].partial_cmp(&row[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                idx.sort_by(|a, b| row[*b].total_cmp(&row[*a]));
                 let up: Vec<(u32, f32)> = idx[..6].iter().map(|&t| (t as u32, row[t])).collect();
                 let down: Vec<(u32, f32)> = idx[vr - 6..].iter().rev().map(|&t| (t as u32, row[t])).collect();
                 unit_voices.insert(*un, (up, down));
@@ -2126,7 +2149,7 @@ fn flow_split(atoms: &[A], infos: &[Info], cx: &Ctx, e: &Engine, m: &Model, g: &
         by.sort_by(|&a, &b| {
             let da = (atom[a * kk] - atom[a * kk + 1]).abs();
             let db = (atom[b * kk] - atom[b * kk + 1]).abs();
-            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+            db.total_cmp(&da)
         });
         by.truncate(40);
         let mut x = vec![0f32; by.len() * d];
@@ -2149,7 +2172,7 @@ fn flow_split(atoms: &[A], infos: &[Info], cx: &Ctx, e: &Engine, m: &Model, g: &
             for (r, &i) in by.iter().enumerate() {
                 let row = &lg[r * vr..(r + 1) * vr];
                 let mut idx: Vec<usize> = (0..vr).collect();
-                idx.sort_by(|a, b| row[*b].partial_cmp(&row[*a]).unwrap_or(std::cmp::Ordering::Equal));
+                idx.sort_by(|a, b| row[*b].total_cmp(&row[*a]));
                 let up: Vec<(u32, f32)> = idx[..6].iter().map(|&t| (t as u32, row[t])).collect();
                 let down: Vec<(u32, f32)> = idx[vr - 6..].iter().rev().map(|&t| (t as u32, row[t])).collect();
                 voices.push((i, up, down));

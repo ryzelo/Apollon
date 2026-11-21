@@ -166,7 +166,7 @@ pub fn repertoire_lines(rd: &Read, rep: &Repertoire) -> Vec<String> {
     }
     let z = rep.z_at(rd, rep.th_max);
     let mut zi: Vec<(usize, f32)> = z.iter().cloned().enumerate().collect();
-    zi.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    zi.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
     let zn = z.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     v.push(format!(
         "  input direction z* for a_max (‖z*‖ = {}): largest coordinates {}",
@@ -236,7 +236,7 @@ fn terminal(m: &Model, s: &Static, o: &Opts, st: &Style) {
     }
     if !s.outputs.voice.is_empty() {
         let mut v = s.outputs.voice.clone();
-        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
         let n = v.len();
         println!(
             "     token voice (final norm at unit scale, output matrix{}): raises {}",
@@ -247,7 +247,7 @@ fn terminal(m: &Model, s: &Static, o: &Opts, st: &Style) {
     }
     if !s.outputs.heads.is_empty() {
         let mut h = s.outputs.heads.clone();
-        h.sort_by(|a, b| b.2.max(b.3.max(0.0)).max(b.4.max(0.0)).partial_cmp(&a.2.max(a.3.max(0.0)).max(a.4.max(0.0))).unwrap_or(std::cmp::Ordering::Equal));
+        h.sort_by(|a, b| b.2.max(b.3.max(0.0)).max(b.4.max(0.0)).total_cmp(&a.2.max(a.3.max(0.0)).max(a.4.max(0.0))));
         println!(
             "     later heads ({}): {}",
             st.yellow("approximation – linear projections only, RoPE and Q/K/V norms ignored"),
@@ -480,7 +480,7 @@ fn html_report(m: &Model, s: &Static, o: &Opts) -> String {
     }
     if !s.outputs.voice.is_empty() {
         let mut v = s.outputs.voice.clone();
-        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
         let n = v.len();
         h += "<details class=\"info\"><summary>Token voice (final norm at unit scale, output matrix)</summary><div class=\"planes\">";
         for (lab, list) in [("raises", v[..k.min(n)].to_vec()), ("lowers", v[n.saturating_sub(k)..].iter().rev().cloned().collect::<Vec<_>>())] {
@@ -494,7 +494,7 @@ fn html_report(m: &Model, s: &Static, o: &Opts) -> String {
     }
     if !s.outputs.heads.is_empty() {
         let mut hs = s.outputs.heads.clone();
-        hs.sort_by(|a, b| b.2.max(b.3).max(b.4).partial_cmp(&a.2.max(a.3).max(a.4)).unwrap_or(std::cmp::Ordering::Equal));
+        hs.sort_by(|a, b| b.2.max(b.3).max(b.4).total_cmp(&a.2.max(a.3).max(a.4)));
         h += "<details class=\"info\"><summary>Later heads (approximation: linear projections, RoPE and Q/K/V norms ignored)</summary><table class=\"tbl\"><tr><th>head</th><th>‖W_Q o‖</th><th>‖W_K o‖</th><th>‖W_V o‖</th></tr>";
         for (l2, hh, q, kk, v) in hs.iter().take(4 * k) {
             let kvc = |x: f32| if x.is_nan() { "shared".to_string() } else { num(x, 3) };

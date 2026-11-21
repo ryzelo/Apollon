@@ -25,6 +25,9 @@ tower-http = { version = "0.6", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 libloading = "0.8"
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+matrixmultiply = { version = "0.3", default-features = false, features = ["std"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
 

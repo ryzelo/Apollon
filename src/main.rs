@@ -20,6 +20,7 @@ mod inspect;
 mod model;
 mod neuron;
 mod probe;
+mod prof;
 mod quant;
 mod readout;
 mod tensor;
